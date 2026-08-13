@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+# Fabrication de l'executable et des mises a jour
+/dist/
+/build_exe/
+
+# Cle privee de signature: ne doit jamais entrer dans le depot.
+*.pem
+
+# Sessions enregistrees et images ecartees, propres a chaque vol.
+invis/sessions/
+
+.DS_Store
+Thumbs.db

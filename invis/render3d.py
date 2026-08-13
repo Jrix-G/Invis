@@ -1,0 +1,248 @@
+"""Rendu du nuage de points 3D, en numpy pur.
+
+Aucune bibliotheque 3D: la scene tient en quelques dizaines de milliers de
+points, et une projection vectorisee suivie d'une ecriture directe dans le
+tampon image coute moins d'une milliseconde. Passer par un moteur de rendu
+couterait plus en installation et en latence qu'il ne rapporterait.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import cv2
+import numpy as np
+
+from . import config
+from .mapper import KIND_GROUND, KIND_OBSTACLE
+
+COLOR_BG = (22, 22, 26)
+COLOR_GRID = (52, 52, 58)
+COLOR_GRID_MAIN = (78, 78, 86)
+COLOR_GROUND_PT = (150, 130, 95)
+COLOR_OBSTACLE_PT = (70, 90, 245)
+COLOR_TRAJ = (120, 220, 120)
+COLOR_DRONE = (250, 250, 250)
+COLOR_TEXT = (215, 215, 215)
+COLOR_DIM = (130, 130, 138)
+
+
+@dataclass
+class OrbitCamera:
+    """Camera d'observation en coordonnees spheriques autour d'une cible."""
+
+    yaw_deg: float = config.VIEW3D_DEFAULT_YAW_DEG
+    pitch_deg: float = config.VIEW3D_DEFAULT_PITCH_DEG
+    range_m: float = config.VIEW3D_DEFAULT_RANGE_M
+    target: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    fov_deg: float = 55.0
+
+    def orbit(self, dyaw: float, dpitch: float) -> None:
+        self.yaw_deg = (self.yaw_deg + dyaw) % 360.0
+        self.pitch_deg = float(np.clip(self.pitch_deg + dpitch, 5.0, 85.0))
+
+    def zoom(self, factor: float) -> None:
+        self.range_m = float(np.clip(self.range_m * factor, 1.0, 60.0))
+
+    def matrices(self, width: int, height: int) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Renvoie (rotation monde->vue, position de l'oeil, focale pixels)."""
+        yaw = math.radians(self.yaw_deg)
+        pitch = math.radians(self.pitch_deg)
+        offset = np.array([
+            math.cos(pitch) * math.cos(yaw),
+            math.cos(pitch) * math.sin(yaw),
+            math.sin(pitch),
+        ]) * self.range_m
+        eye = np.asarray(self.target, dtype=np.float64) + offset
+
+        forward = np.asarray(self.target, dtype=np.float64) - eye
+        forward /= max(1e-9, np.linalg.norm(forward))
+        world_up = np.array([0.0, 0.0, 1.0])
+        right = np.cross(forward, world_up)
+        if np.linalg.norm(right) < 1e-6:
+            right = np.array([1.0, 0.0, 0.0])
+        right /= np.linalg.norm(right)
+        up = np.cross(right, forward)
+
+        R = np.vstack([right, -up, forward])   # lignes: x ecran, y ecran, profondeur
+        f = (height / 2.0) / math.tan(math.radians(self.fov_deg / 2.0))
+        return R, eye, f
+
+
+class Renderer3D:
+    """Dessine le nuage, la trajectoire et le drone dans un tampon reutilise."""
+
+    def __init__(self, size: Tuple[int, int] = config.VIEW3D_SIZE) -> None:
+        self.width, self.height = size
+        self.camera = OrbitCamera()
+        self._canvas = np.empty((self.height, self.width, 3), dtype=np.uint8)
+        self.auto_follow = True
+        self.spin_dps = 0.0
+
+    def resize(self, width: int, height: int) -> None:
+        if width == self.width and height == self.height:
+            return
+        self.width, self.height = max(80, width), max(60, height)
+        self._canvas = np.empty((self.height, self.width, 3), dtype=np.uint8)
+
+    # -- projection --------------------------------------------------------
+
+    def _project(self, pts: np.ndarray, R: np.ndarray, eye: np.ndarray, f: float,
+                 clip_to_view: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Projette des points monde. Renvoie (u, v, masque utilisable).
+
+        `clip_to_view` sert aux points, qu'on ecrit directement dans le tampon
+        et qui doivent donc tomber dedans. Pour les segments il faut le
+        desactiver: une ligne dont une extremite sort du cadre reste visible
+        entre les deux, et l'exiger dans le cadre effacait toute la grille.
+        """
+        if len(pts) == 0:
+            empty = np.zeros(0, dtype=np.int32)
+            return empty, empty, np.zeros(0, dtype=bool)
+        cam = (pts - eye) @ R.T
+        z = cam[:, 2]
+        usable = z > 0.05
+        u = np.zeros(len(pts))
+        v = np.zeros(len(pts))
+        np.divide(cam[:, 0] * f, z, out=u, where=usable)
+        np.divide(cam[:, 1] * f, z, out=v, where=usable)
+        u = u + self.width / 2.0
+        v = v + self.height / 2.0
+        if clip_to_view:
+            usable &= (u >= 0) & (u < self.width) & (v >= 0) & (v < self.height)
+        else:
+            # cv2.line coupe tout seul, mais deraille sur des coordonnees
+            # enormes: on borne largement autour du cadre.
+            limit = 10 * max(self.width, self.height)
+            np.clip(u, -limit, limit, out=u)
+            np.clip(v, -limit, limit, out=v)
+        return u.astype(np.int32), v.astype(np.int32), usable
+
+    # -- rendu -------------------------------------------------------------
+
+    def render(self, mapper, frame=None, dt: float = 0.0) -> np.ndarray:
+        img = self._canvas
+        img[:] = COLOR_BG
+
+        if self.spin_dps and dt:
+            self.camera.orbit(self.spin_dps * dt, 0.0)
+
+        pos = np.asarray(frame.position, dtype=np.float64) if frame is not None else np.zeros(3)
+        if self.auto_follow:
+            # Suivre le drone en gardant le sol comme reference verticale.
+            self.camera.target = (float(pos[0]), float(pos[1]), 0.0)
+
+        R, eye, f = self.camera.matrices(self.width, self.height)
+
+        self._draw_grid(img, R, eye, f, centre=pos)
+        self._draw_cloud(img, mapper, R, eye, f)
+        self._draw_trajectory(img, mapper, R, eye, f)
+        if frame is not None:
+            self._draw_drone(img, frame, R, eye, f)
+        self._draw_legend(img, mapper, frame)
+        return img
+
+    def _draw_grid(self, img: np.ndarray, R: np.ndarray, eye: np.ndarray,
+                   f: float, centre: np.ndarray, step: float = 1.0) -> None:
+        half = max(4.0, min(20.0, self.camera.range_m))
+        cx = math.floor(centre[0] / step) * step
+        cy = math.floor(centre[1] / step) * step
+        ticks = np.arange(-half, half + step, step)
+
+        starts = []
+        ends = []
+        for t in ticks:
+            starts.append([cx + t, cy - half, 0.0])
+            ends.append([cx + t, cy + half, 0.0])
+            starts.append([cx - half, cy + t, 0.0])
+            ends.append([cx + half, cy + t, 0.0])
+        if not starts:
+            return
+
+        s = np.asarray(starts)
+        e = np.asarray(ends)
+        us, vs, oks = self._project(s, R, eye, f, clip_to_view=False)
+        ue, ve, oke = self._project(e, R, eye, f, clip_to_view=False)
+        both = oks & oke
+        for i in np.flatnonzero(both):
+            main = (abs(s[i, 0] % 5.0) < 1e-6) or (abs(s[i, 1] % 5.0) < 1e-6)
+            cv2.line(img, (us[i], vs[i]), (ue[i], ve[i]),
+                     COLOR_GRID_MAIN if main else COLOR_GRID, 1, cv2.LINE_AA)
+
+    def _draw_cloud(self, img: np.ndarray, mapper, R: np.ndarray, eye: np.ndarray,
+                    f: float) -> None:
+        xyz, kind, _stamp = mapper.cloud.view()
+        if len(xyz) == 0:
+            return
+        u, v, ok = self._project(xyz.astype(np.float64), R, eye, f)
+        if not ok.any():
+            return
+
+        ground = ok & (kind == KIND_GROUND)
+        obstacle = ok & (kind == KIND_OBSTACLE)
+
+        # Ecriture directe: une passe numpy par categorie, sans boucle Python.
+        if ground.any():
+            img[v[ground], u[ground]] = COLOR_GROUND_PT
+        if obstacle.any():
+            # Les obstacles comptent plus que le sol: on les epaissit pour
+            # qu'ils restent lisibles quand le nuage de sol est dense.
+            uu, vv = u[obstacle], v[obstacle]
+            img[vv, uu] = COLOR_OBSTACLE_PT
+            for du, dv in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nu = np.clip(uu + du, 0, self.width - 1)
+                nv = np.clip(vv + dv, 0, self.height - 1)
+                img[nv, nu] = COLOR_OBSTACLE_PT
+
+    def _draw_trajectory(self, img: np.ndarray, mapper, R: np.ndarray,
+                         eye: np.ndarray, f: float) -> None:
+        traj = mapper.trajectory
+        if len(traj) < 2:
+            return
+        pts = np.asarray(traj[-config.TRAJECTORY_CAPACITY:], dtype=np.float64)
+        u, v, ok = self._project(pts, R, eye, f, clip_to_view=False)
+        idx = np.flatnonzero(ok)
+        if len(idx) < 2:
+            return
+        poly = np.stack([u[idx], v[idx]], axis=1).astype(np.int32)
+        cv2.polylines(img, [poly], False, COLOR_TRAJ, 1, cv2.LINE_AA)
+
+    def _draw_drone(self, img: np.ndarray, frame, R: np.ndarray, eye: np.ndarray,
+                    f: float) -> None:
+        pos = np.asarray(frame.position, dtype=np.float64)
+        yaw = math.radians(frame.yaw_deg)
+        c, s = math.cos(yaw), math.sin(yaw)
+        nose = pos + np.array([c, s, 0.0]) * 0.6
+        left = pos + np.array([-0.25 * c - 0.25 * -s, -0.25 * s - 0.25 * c, 0.0])
+        right = pos + np.array([-0.25 * c + 0.25 * -s, -0.25 * s + 0.25 * c, 0.0])
+        ground = np.array([pos[0], pos[1], 0.0])
+
+        pts = np.vstack([pos, nose, left, right, ground])
+        u, v, ok = self._project(pts, R, eye, f)
+        if not ok[0]:
+            return
+        if ok[1]:
+            cv2.line(img, (u[0], v[0]), (u[1], v[1]), COLOR_DRONE, 2, cv2.LINE_AA)
+        if ok[2] and ok[3]:
+            cv2.line(img, (u[2], v[2]), (u[3], v[3]), COLOR_DRONE, 1, cv2.LINE_AA)
+        if ok[4]:
+            # Verticale jusqu'au sol: sans elle, l'altitude est illisible.
+            cv2.line(img, (u[0], v[0]), (u[4], v[4]), COLOR_DIM, 1, cv2.LINE_AA)
+        cv2.circle(img, (u[0], v[0]), 3, COLOR_DRONE, -1, cv2.LINE_AA)
+
+    def _draw_legend(self, img: np.ndarray, mapper, frame) -> None:
+        cv2.putText(img, f"nuage {len(mapper.cloud)} pts", (6, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, COLOR_TEXT, 1, cv2.LINE_AA)
+        cv2.putText(img, "sol", (6, self.height - 18), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.36, COLOR_GROUND_PT, 1, cv2.LINE_AA)
+        cv2.putText(img, "obstacle", (44, self.height - 18), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.36, COLOR_OBSTACLE_PT, 1, cv2.LINE_AA)
+        cv2.putText(img, "trajet", (118, self.height - 18), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.36, COLOR_TRAJ, 1, cv2.LINE_AA)
+        if frame is not None:
+            txt = (f"vue {self.camera.range_m:.0f} m  "
+                   f"cap {frame.yaw_deg:+.0f} deg  z {frame.position[2]:.2f} m")
+            cv2.putText(img, txt, (6, self.height - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.36, COLOR_DIM, 1, cv2.LINE_AA)
