@@ -1,5 +1,7 @@
 # Invis
 
+*[English version](README.en.md)*
+
 Station sol pour drone equipe d'une ESP32-CAM: distances metriques, detection
 d'obstacle et reconstruction 3D de la scene, en direct, a partir d'une seule
 camera.
@@ -9,12 +11,12 @@ camera.
 ### Linux
 
 ```bash
-wget https://github.com/Jrix-G/Invis/releases/latest/download/Invis-1.0.0-linux-x86_64.tar.gz
-tar xzf Invis-1.0.0-linux-x86_64.tar.gz
-./EspCamVision/EspCamVision
+wget https://github.com/Jrix-G/Invis/releases/latest/download/Invis-1.0.1-linux-x86_64.tar.gz
+tar xzf Invis-1.0.1-linux-x86_64.tar.gz
+./Invis/Invis
 ```
 
-Le fichier a lancer s'appelle `EspCamVision`, **sans `.exe`**. S'il porte une
+Le fichier a lancer s'appelle `Invis`, **sans `.exe`**. S'il porte une
 extension `.exe`, c'est l'archive Windows: Linux la confie a Mono, qui repond
 `does not contain a valid CIL image`.
 
@@ -27,8 +29,8 @@ sudo apt install libgl1 libglib2.0-0
 ### Windows
 
 Telecharger
-[`Invis-1.0.0-windows.zip`](https://github.com/Jrix-G/Invis/releases/latest),
-decompresser, lancer `EspCamVision.exe`.
+[`Invis-1.0.1-windows.zip`](https://github.com/Jrix-G/Invis/releases/latest),
+decompresser, lancer `Invis.exe`.
 
 Windows affichera *« Windows a protege votre ordinateur »* au premier
 lancement: cliquer sur **Informations complementaires** puis **Executer quand
@@ -66,7 +68,7 @@ Les autres outils:
 
 ```bash
 python -m invis.gcs_vision --source sim --connect # interface, sans drone
-python -m invis.test_invis                        # 74 tests, sans materiel
+python -m invis.test_invis                        # 80 tests, sans materiel
 python -m invis.bench --host 192.168.4.50         # mesure de cadence du lien
 python -m invis.diag_stream --host 192.168.4.50   # diagnostic des coupures
 python -m invis.replay <session> --height 2.4     # rejeu d'un vol enregistre
@@ -86,8 +88,10 @@ dialogue avec elle qu'en HTTP.
 | **1. camera** — image, champ de vecteurs, reperes de distance au sol, ligne de contact | **2. mesures** — distances, temps avant contact, assiette, cadences, vue de dessus |
 | **3. reconstruction 3D** — nuage qui se construit au fil du vol, trajectoire, drone | **4. libre** |
 
-Sur la vue 3D: glisser pour tourner autour, molette pour zoomer. *Suivre*
-recentre sur le drone, *Rotation* fait tourner la vue lentement.
+Sur la vue 3D: **clic gauche** pour tourner autour (-88 a +88 degres, y
+compris par en dessous), **clic droit** pour deplacer la vue, **double-clic**
+pour recentrer, molette pour zoomer. Deplacer la vue relache le suivi du
+drone: sans cela elle se recentrerait a chaque image.
 
 Champ de vecteurs: **vert** = point qui suit le sol, **rouge** = point qui ne
 le suit pas, donc du relief. La longueur des vecteurs est amplifiee, avec un
@@ -216,7 +220,7 @@ le signal meme qu'on cherche.
 | `updater.py` / `release.py` | mise a jour signee, fabrication et publication |
 | `build_app.py` | fabrication de l'executable autonome |
 | `bench.py` / `diag_stream.py` | cadence du lien, diagnostic des coupures |
-| `test_invis.py` | 74 tests, sans materiel |
+| `test_invis.py` | 80 tests, sans materiel |
 
 ## Reglages
 
@@ -230,3 +234,12 @@ le signal meme qu'on cherche.
 | `config.CAMERA_TILT_DEG` | inclinaison nominale, point de depart de la calibration |
 
 Regler a partir d'une session enregistree (`replay.py`), pas en vol.
+
+## Mises a jour
+
+L'application verifie les nouvelles versions au demarrage et **propose** de les
+installer -- jamais pendant une connexion a la camera. Les archives sont
+signees Ed25519; toute archive non signee, alteree, plus ancienne, servie en
+clair, ou dont les chemins sortent du dossier cible est refusee.
+
+Seul le code circule (environ 70 Ko), pas l'executable (environ 150 Mo).
