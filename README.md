@@ -13,9 +13,25 @@ qu'en HTTP.
 
 ## Installation
 
+**Executable pret a l'emploi** (aucune installation de Python):
+[dernieres versions](https://github.com/Jrix-G/Invis/releases/latest) —
+`.zip` pour Windows, `.tar.gz` pour Linux.
+
+Sous Linux, l'archive conserve le bit d'execution:
+
+```bash
+tar xzf Invis-1.0.0-linux-x86_64.tar.gz
+./EspCamVision/EspCamVision
+```
+
+**Depuis les sources:**
+
 ```bash
 python -m pip install -r requirements.txt
 ```
+
+Sous Linux, Tkinter n'est pas toujours installe avec Python:
+`sudo apt install python3-tk`.
 
 ## Lancement
 
