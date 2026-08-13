@@ -4,48 +4,80 @@ Station sol pour drone equipe d'une ESP32-CAM: distances metriques, detection
 d'obstacle et reconstruction 3D de la scene, en direct, a partir d'une seule
 camera.
 
-**Lecture seule cote vol** — aucun endpoint `/pilot` n'est appele, aucune
-commande n'est envoyee au controleur de vol. Le programme observe, il ne
-pilote pas.
+## Demarrer
 
-Le firmware de la carte vit dans un depot separe: Invis ne dialogue avec elle
-qu'en HTTP.
-
-## Installation
-
-**Executable pret a l'emploi** (aucune installation de Python):
-[dernieres versions](https://github.com/Jrix-G/Invis/releases/latest) —
-`.zip` pour Windows, `.tar.gz` pour Linux.
-
-Sous Linux, l'archive conserve le bit d'execution:
+### Linux
 
 ```bash
+wget https://github.com/Jrix-G/Invis/releases/latest/download/Invis-1.0.0-linux-x86_64.tar.gz
 tar xzf Invis-1.0.0-linux-x86_64.tar.gz
 ./EspCamVision/EspCamVision
 ```
 
-**Depuis les sources:**
+Le fichier a lancer s'appelle `EspCamVision`, **sans `.exe`**. S'il porte une
+extension `.exe`, c'est l'archive Windows: Linux la confie a Mono, qui repond
+`does not contain a valid CIL image`.
+
+Si le programme refuse de demarrer:
 
 ```bash
-python -m pip install -r requirements.txt
+sudo apt install libgl1 libglib2.0-0
 ```
 
-Sous Linux, Tkinter n'est pas toujours installe avec Python:
-`sudo apt install python3-tk`.
+### Windows
 
-## Lancement
+Telecharger
+[`Invis-1.0.0-windows.zip`](https://github.com/Jrix-G/Invis/releases/latest),
+decompresser, lancer `EspCamVision.exe`.
+
+Windows affichera *« Windows a protege votre ordinateur »* au premier
+lancement: cliquer sur **Informations complementaires** puis **Executer quand
+meme**. L'application n'est pas signee numeriquement.
+
+### Puis, dans l'application
+
+1. Connecter la machine au **Wi-Fi du drone**
+2. Hote `192.168.4.50`, cliquer **Connect**
+3. Renseigner la **hauteur de vol** dans la barre du haut, puis *Appliquer*
+4. Si l'image est a l'envers, ajuster **Miroir H** / **Miroir V**
+
+La hauteur est la seule grandeur metrique du systeme: toutes les distances lui
+sont proportionnelles. Si elle est inconnue, saisir `1.00` — les distances sont
+alors exprimees en hauteurs de vol, ce qui reste exact.
+
+Tant que l'image n'est pas droite, **les distances sont fausses**: c'est la
+ligne d'image qui porte la distance.
+
+### Sans drone
+
+`Source` -> `sim` -> **Connect**. Un vol synthetique complet, rien a brancher.
+
+## Depuis les sources
 
 ```bash
-python -m invis.gcs_vision                        # interface
-python -m invis.gcs_vision --source sim --connect # sans drone, sur simulateur
+git clone https://github.com/Jrix-G/Invis.git
+cd Invis
+sudo apt install python3-tk        # Linux: Tkinter n'est pas toujours livre avec Python
+pip install -r requirements.txt
+python -m invis.gcs_vision
+```
+
+Les autres outils:
+
+```bash
+python -m invis.gcs_vision --source sim --connect # interface, sans drone
 python -m invis.test_invis                        # 74 tests, sans materiel
 python -m invis.bench --host 192.168.4.50         # mesure de cadence du lien
 python -m invis.diag_stream --host 192.168.4.50   # diagnostic des coupures
 python -m invis.replay <session> --height 2.4     # rejeu d'un vol enregistre
 ```
 
-Le mode `--source sim` fait tourner l'ensemble sur un vol synthetique: rien a
-brancher pour voir ce que le programme fait.
+---
+
+**Lecture seule cote vol** — aucun endpoint `/pilot` n'est appele, aucune
+commande n'est envoyee au controleur de vol. Le programme observe, il ne
+pilote pas. Le firmware de la carte vit dans un depot separe: Invis ne
+dialogue avec elle qu'en HTTP.
 
 ## Les quatre panneaux
 
