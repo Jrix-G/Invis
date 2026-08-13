@@ -826,6 +826,71 @@ def test_updater() -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_bootstrap() -> None:
+    """Le code mis a jour doit reellement remplacer le code embarque.
+
+    Sans ce mecanisme, tout le systeme de mise a jour est inerte: l'archive se
+    telecharge, se verifie, s'installe... et l'application relance le code
+    embarque dans l'executable. Le defaut est silencieux, d'ou ce test.
+    """
+    print("\n-- choix du code au demarrage ------------------------------")
+    import shutil
+    import tempfile
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import invis_bootstrap as bs
+
+    work = tempfile.mkdtemp(prefix="boot_test_")
+    saved_path = list(sys.path)
+    saved_dir = bs.data_dir
+    try:
+        bundle = os.path.join(work, "bundle")
+        os.makedirs(os.path.join(bundle, "invis"))
+        with open(os.path.join(bundle, "invis", "version.py"), "w", encoding="utf-8") as fh:
+            fh.write('VERSION = "1.0.0"\n')
+
+        root = os.path.join(work, "data", "payload")
+        for version in ("0.9.0", "1.0.1", "1.0.10"):
+            d = os.path.join(root, version, "invis")
+            os.makedirs(d)
+            with open(os.path.join(d, "version.py"), "w", encoding="utf-8") as fh:
+                fh.write(f'VERSION = "{version}"\n')
+        # Dossier sans version lisible: doit etre ignore sans faire echouer.
+        os.makedirs(os.path.join(root, "casse", "invis"))
+
+        bs.data_dir = lambda app_name=None: os.path.join(work, "data")
+
+        _check(bs.bundled_version(bundle) == "1.0.0", "version embarquee lue sans import",
+               bs.bundled_version(bundle) or "aucune")
+
+        found = [v for _p, v, _d in bs.candidates(root)]
+        _check(found == ["1.0.10", "1.0.1", "0.9.0"],
+               "versions triees numeriquement, invalides ecartees", str(found))
+
+        chosen = bs.activate(bundle_root=bundle)
+        _check(chosen is not None and os.path.basename(chosen) == "1.0.10",
+               "la plus recente est retenue",
+               os.path.basename(chosen) if chosen else "aucune")
+        _check(chosen is not None and sys.path[0] == chosen,
+               "placee devant le code embarque")
+
+        # Rien de plus recent que l'embarque: on garde l'embarque.
+        sys.path[:] = saved_path
+        with open(os.path.join(bundle, "invis", "version.py"), "w", encoding="utf-8") as fh:
+            fh.write('VERSION = "9.9.9"\n')
+        _check(bs.activate(bundle_root=bundle) is None,
+               "aucune version plus recente -> code embarque conserve")
+
+        # Emplacement illisible: le demarrage ne doit pas echouer.
+        bs.data_dir = lambda app_name=None: os.path.join(work, "inexistant")
+        _check(bs.activate(bundle_root=bundle) is None,
+               "dossier absent -> repli silencieux, pas d'erreur")
+    finally:
+        bs.data_dir = saved_dir
+        sys.path[:] = saved_path
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def main() -> int:
     test_geometry()
     test_orientation()
@@ -838,6 +903,7 @@ def main() -> int:
     test_link()
     test_truncated_frames()
     test_updater()
+    test_bootstrap()
     test_session_roundtrip()
     print()
     if _failures:

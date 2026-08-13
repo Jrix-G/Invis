@@ -40,11 +40,33 @@ class OrbitCamera:
     fov_deg: float = 55.0
 
     def orbit(self, dyaw: float, dpitch: float) -> None:
+        """Tourne autour de la cible.
+
+        Le tangage descend sous l'horizon: regarder la scene par en dessous
+        sert a juger la hauteur des points, ce qu'une vue plongeante rend
+        justement difficile. Il reste borne juste avant la verticale, ou le
+        repere de la camera devient indetermine.
+        """
         self.yaw_deg = (self.yaw_deg + dyaw) % 360.0
-        self.pitch_deg = float(np.clip(self.pitch_deg + dpitch, 5.0, 85.0))
+        self.pitch_deg = float(np.clip(self.pitch_deg + dpitch, -88.0, 88.0))
+
+    def pan(self, dx_screen: float, dy_screen: float) -> None:
+        """Deplace la cible dans le plan de l'ecran.
+
+        Sans cela, la vue reste rivee au drone et une zone du nuage exploree
+        plus tot devient inatteignable.
+        """
+        yaw = math.radians(self.yaw_deg)
+        # Vecteurs droite et avant de la vue, projetes au sol.
+        right = np.array([-math.sin(yaw), math.cos(yaw), 0.0])
+        forward = np.array([-math.cos(yaw), -math.sin(yaw), 0.0])
+        scale = self.range_m / 400.0
+        target = np.asarray(self.target, dtype=np.float64)
+        target = target + right * (dx_screen * scale) + forward * (dy_screen * scale)
+        self.target = (float(target[0]), float(target[1]), float(target[2]))
 
     def zoom(self, factor: float) -> None:
-        self.range_m = float(np.clip(self.range_m * factor, 1.0, 60.0))
+        self.range_m = float(np.clip(self.range_m * factor, 0.4, 200.0))
 
     def matrices(self, width: int, height: int) -> Tuple[np.ndarray, np.ndarray, float]:
         """Renvoie (rotation monde->vue, position de l'oeil, focale pixels)."""

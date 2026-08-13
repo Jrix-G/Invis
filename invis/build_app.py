@@ -2,7 +2,7 @@
 
     python -m invis.build_app
 
-Produit un dossier `dist/EspCamVision/` contenant l'executable et ses
+Produit un dossier `dist/Invis/` contenant l'executable et ses
 dependances.
 
 Pourquoi un dossier et non un fichier unique
@@ -36,7 +36,7 @@ import subprocess
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NAME = "EspCamVision"
+NAME = "Invis"
 
 # Modules a exclure du binaire livre.
 EXCLUDES = [
@@ -52,20 +52,30 @@ EXCLUDES = [
 ]
 
 
+ENTRY_SOURCE = '''"""Point d'entree de l'executable."""
+import multiprocessing
+import sys
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
+    # Choisir le code a executer AVANT d'importer le paquet. Des que `invis`
+    # est importe, son emplacement est fixe: une mise a jour installee ne
+    # serait alors jamais chargee, et le mecanisme entier resterait inerte.
+    import invis_bootstrap
+    invis_bootstrap.activate()
+
+    from invis.gcs_vision import main
+    sys.exit(main())
+'''
+
+
 def entry_point() -> str:
     """Point d'entree: un fichier minuscule qui lance l'interface."""
     path = os.path.join(REPO_ROOT, "dist", "_entry.py")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(
-            '"""Point d\'entree de l\'executable."""\n'
-            "import multiprocessing, sys\n"
-            "\n"
-            "if __name__ == '__main__':\n"
-            "    multiprocessing.freeze_support()\n"
-            "    from invis.gcs_vision import main\n"
-            "    sys.exit(main())\n"
-        )
+        fh.write(ENTRY_SOURCE)
     return path
 
 
@@ -81,7 +91,8 @@ EXCLUDE_BINARIES = (
 )
 
 SPEC_TEMPLATE = """# -*- mode: python ; coding: utf-8 -*-
-a = Analysis([r'{entry}'], pathex=[r'{root}'], excludes={excludes!r})
+a = Analysis([r'{entry}'], pathex=[r'{root}'],
+             hiddenimports=['invis_bootstrap'], excludes={excludes!r})
 
 _ecartes = {exclude_bin!r}
 a.binaries = TOC([b for b in a.binaries

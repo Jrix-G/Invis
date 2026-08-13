@@ -83,6 +83,7 @@ class VisionApp(tk.Tk):
         self._photo: Optional[tk.PhotoImage] = None
         self._cell = (480, 352)
         self._drag: Optional[Tuple[int, int]] = None
+        self._pan: Optional[Tuple[int, int]] = None
 
         self._analysis_fps = 0.0
         self._analysis_window: list = []
@@ -172,6 +173,14 @@ class VisionApp(tk.Tk):
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_drag", None))
+        # Bouton droit ou milieu: deplacement lateral de la vue.
+        for press, motion in (("<ButtonPress-3>", "<B3-Motion>"),
+                              ("<ButtonPress-2>", "<B2-Motion>")):
+            self.canvas.bind(press, self._on_pan_start)
+            self.canvas.bind(motion, self._on_pan)
+        self.canvas.bind("<ButtonRelease-3>", lambda _e: setattr(self, "_pan", None))
+        self.canvas.bind("<ButtonRelease-2>", lambda _e: setattr(self, "_pan", None))
+        self.canvas.bind("<Double-Button-1>", self._on_recenter)
         self.canvas.bind("<MouseWheel>", self._on_wheel)
 
         console_frame = ttk.Frame(body)
@@ -265,6 +274,36 @@ class VisionApp(tk.Tk):
         dy = event.y - self._drag[1]
         self._drag = (event.x, event.y)
         self.renderer.camera.orbit(-dx * 0.4, dy * 0.3)
+
+    def _on_pan_start(self, event) -> None:
+        if self._in_view3d(event.x, event.y):
+            self._pan = (event.x, event.y)
+
+    def _on_pan(self, event) -> None:
+        """Deplace la vue, et lache le suivi automatique.
+
+        Viser une zone precise pendant que la vue se recentre sur le drone a
+        chaque image est impossible: se deplacer implique donc de cesser de
+        suivre. La case *Suivre* le reactive.
+        """
+        if self._pan is None:
+            return
+        dx = event.x - self._pan[0]
+        dy = event.y - self._pan[1]
+        self._pan = (event.x, event.y)
+        if self.var_follow.get():
+            self.var_follow.set(False)
+            self.renderer.auto_follow = False
+            self.log("vue libre: le suivi du drone est relache (case Suivre pour revenir)")
+        self.renderer.camera.pan(-dx, -dy)
+
+    def _on_recenter(self, event) -> None:
+        """Double-clic: revenir sur le drone."""
+        if not self._in_view3d(event.x, event.y):
+            return
+        self.var_follow.set(True)
+        self._apply_view()
+        self.log("vue recentree sur le drone")
 
     def _on_wheel(self, event) -> None:
         if not self._in_view3d(event.x, event.y):
