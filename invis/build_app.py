@@ -89,8 +89,8 @@ a.binaries = TOC([b for b in a.binaries
 
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, exclude_binaries=True, name='{name}',
-          console=False, debug=False, strip=False, upx=False)
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='{name}')
+          console=False, debug=False, strip={strip}, upx=False)
+coll = COLLECT(exe, a.binaries, a.datas, strip={strip}, upx=False, name='{name}')
 """
 
 
@@ -98,9 +98,15 @@ def write_spec(entry: str, build_dir: str) -> str:
     os.makedirs(build_dir, exist_ok=True)
     path = os.path.join(build_dir, NAME + ".spec")
     with open(path, "w", encoding="utf-8") as fh:
+        # Retrait des symboles de debogage. Sous Linux ils representent
+        # l'essentiel du surpoids -- 442 Mo mesures sans, contre 149 Mo pour
+        # le binaire Windows equivalent. Sous Windows l'operation n'apporte
+        # rien et peut abimer certaines DLL: on ne l'y applique pas.
+        strip = sys.platform != "win32"
         fh.write(SPEC_TEMPLATE.format(entry=entry, root=REPO_ROOT, name=NAME,
                                       excludes=list(EXCLUDES),
-                                      exclude_bin=list(EXCLUDE_BINARIES)))
+                                      exclude_bin=list(EXCLUDE_BINARIES),
+                                      strip=strip))
     return path
 
 
@@ -145,7 +151,10 @@ def main() -> int:
         print(f"\n{target}  ({total / 1e6:.0f} Mo)")
     exe = NAME + (".exe" if sys.platform == "win32" else "")
     print(f"executable: {exe}")
-    print("\nRappel: non signe -> avertissement SmartScreen au premier lancement.")
+    if sys.platform == "win32":
+        print("\nRappel: non signe -> avertissement SmartScreen au premier lancement.")
+    else:
+        print("\nRappel: rendre l'executable executable apres extraction (chmod +x).")
     return 0
 
 
