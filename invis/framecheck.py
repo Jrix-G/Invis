@@ -109,9 +109,16 @@ class FrameGate:
         # depasse en permanence, tandis qu'une corruption breve sur une scene
         # terne reste en dessous. Ce qui distingue la corruption, c'est qu'elle
         # *surgit* -- donc on compare a la mediane recente.
+        # Tant qu'aucune reference n'existe, le critere couleur n'a pas d'avis.
+        #
+        # Le calculer quand meme revenait a comparer l'ecart *absolu* -- jusqu'a
+        # 1,0 sur une scene coloree -- a un seuil de 0,02 pense pour un *exces*
+        # relatif. La premiere image etait donc rejetee, or seules les images
+        # acceptees alimentent la reference: celle-ci ne se formait jamais et le
+        # filtre rejetait indefiniment une scene parfaitement saine.
         ref_chroma = float(np.median(self._chroma)) if len(self._chroma) >= 5 else None
-        quality.chroma_excess = (quality.chroma_defect
-                                 - (ref_chroma if ref_chroma is not None else 0.0))
+        quality.chroma_excess = (quality.chroma_defect - ref_chroma
+                                 if ref_chroma is not None else 0.0)
 
         if jpeg_size > 0:
             ref_size = float(np.median(self._sizes)) if len(self._sizes) >= 5 else 0.0
@@ -145,9 +152,17 @@ class FrameGate:
             self._streak += 1
             if self._streak >= config.QUALITY_MAX_STREAK:
                 quality.verdict = VERDICT_DEGRADED
-                quality.reason = "scene pauvre en details, reference reetalonnee"
+                quality.reason = "scene inhabituelle, reference reetalonnee"
+                # Reetalonner veut dire *se caler sur ce que la camera montre
+                # maintenant*, pas oublier. Vider les references les laissait
+                # vides -- une image DEGRADED ne les alimente pas non plus --
+                # et le cycle de rejets repartait a l'identique. On les amorce
+                # donc explicitement sur l'image courante.
                 self._sharpness.clear()
                 self._chroma.clear()
+                for _ in range(5):
+                    self._sharpness.append(quality.sharpness)
+                    self._chroma.append(quality.chroma_defect)
                 self._streak = 0
         else:
             self._streak = 0

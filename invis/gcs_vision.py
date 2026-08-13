@@ -90,6 +90,8 @@ class VisionApp(tk.Tk):
         self._last_state: Optional[str] = None
         self._last_obstacle_log = 0.0
         self._quality_warned = 0.0
+        self._last_result = None
+        self._last_mapframe = None
         self._update_dismissed = False
         self._t0 = time.time()
 
@@ -416,40 +418,55 @@ class VisionApp(tk.Tk):
             # distance, et un miroir simple inverse le sens du repere.
             bgr = geometry.orient_frame(bgr, self.var_flip_h.get(), self.var_flip_v.get())
 
+            # Une image ecartee ne doit pas geler l'ecran.
+            #
+            # Le rejet portait aussi sur l'affichage: l'image restait figee
+            # jusqu'au prochain passage du filtre, soit huit images -- plus
+            # d'une seconde a la cadence de cette camera. Le flux, lui,
+            # arrivait normalement. On saute donc l'*analyse*, jamais le
+            # *rendu*: la derniere mesure valable reste affichee, signalee
+            # comme telle, et l'image continue de defiler.
             quality = self.gate.check(bgr, jpeg_size=len(frame.jpeg))
-            if self.var_gate.get() and quality.verdict == VERDICT_REJECT:
+            stale = self.var_gate.get() and quality.verdict == VERDICT_REJECT
+            if stale:
                 self._warn_quality(quality)
-                continue
+                result, mapframe = self._last_result, self._last_mapframe
+                if result is None:
+                    continue
 
-            try:
-                result = self.detector.process(bgr, frame.recv_time)
-                mapframe = self.mapper.update(result)
-            except cv2.error as exc:
-                self.log(f"analyse en echec: {exc}")
-                self.detector.reset()
-                continue
+            else:
+                try:
+                    result = self.detector.process(bgr, frame.recv_time)
+                    mapframe = self.mapper.update(result)
+                except cv2.error as exc:
+                    self.log(f"analyse en echec: {exc}")
+                    self.detector.reset()
+                    continue
+                self._last_result, self._last_mapframe = result, mapframe
 
             now = time.time()
             dt_render, last = now - last, now
             self._tick_analysis_fps()
             self._report(result, mapframe)
 
-            if self.recorder:
+            if self.recorder and not stale:
                 try:
                     self.recorder.write(result, frame.jpeg, frame_time=frame.recv_time)
                 except Exception as exc:  # noqa: BLE001
                     self.log(f"ecriture session en echec: {exc}")
 
-            composed = self._compose(bgr, result, mapframe, dt_render)
+            composed = self._compose(bgr, result, mapframe, dt_render, stale=stale)
             ppm = overlay.to_ppm(composed)
             if ppm:
                 with self._render_lock:
                     self._render_slot = (ppm, self._status_line(result, mapframe))
 
-    def _compose(self, bgr, result, mapframe, dt_render: float) -> np.ndarray:
+    def _compose(self, bgr, result, mapframe, dt_render: float,
+                 stale: bool = False) -> np.ndarray:
         cw, ch = self._cell
         view = overlay.draw(bgr, result, show_flow=self.var_flow.get(),
-                            mapframe=mapframe, show_ranges=self.var_ranges.get())
+                            mapframe=mapframe, show_ranges=self.var_ranges.get(),
+                            stale=stale)
         link_fps = self.link.stats.fps if self.link else 0.0
         measures = panels.draw_measures((cw, ch - 16), result, mapframe,
                                         link_fps=link_fps,

@@ -23,7 +23,7 @@ COLOR_CONTACT = (60, 200, 255)
 
 
 def draw(frame: np.ndarray, result: DetectionResult, show_flow: bool = True,
-         mapframe=None, show_ranges: bool = True) -> np.ndarray:
+         mapframe=None, show_ranges: bool = True, stale: bool = False) -> np.ndarray:
     """Retourne une copie annotee de l'image."""
     out = frame.copy()
     h, w = out.shape[:2]
@@ -59,6 +59,12 @@ def draw(frame: np.ndarray, result: DetectionResult, show_flow: bool = True,
     if mapframe is not None:
         _draw_contact(out, mapframe, w, h)
     _draw_hud(out, result, w, h, mapframe)
+    if stale:
+        # L'image est affichee mais n'a pas ete analysee: les mesures montrees
+        # datent de l'image precedente. Le dire, sinon elles passent pour
+        # fraiches.
+        cv2.putText(out, "image ecartee - mesures precedentes", (4, h - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, COLOR_CONTACT, 1, cv2.LINE_AA)
     return out
 
 
