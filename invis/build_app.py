@@ -69,6 +69,41 @@ def entry_point() -> str:
     return path
 
 
+# Binaires embarques par defaut mais jamais appeles par Invis. Le plus gros
+# est le codec video d'OpenCV: Invis decode du JPEG depuis la memoire et
+# n'ouvre aucun fichier video. Trente megaoctets pour du code mort.
+#
+# A ne PAS esperer d'opencv-python-headless: la variante sans interface
+# graphique pese exactement autant (117,4 Mo contre 117,9 Mo), embarque le
+# meme codec, et son imshow leve une erreur a l'appel. Mesure faite, gain nul.
+EXCLUDE_BINARIES = (
+    "opencv_videoio_ffmpeg",
+)
+
+SPEC_TEMPLATE = """# -*- mode: python ; coding: utf-8 -*-
+a = Analysis([r'{entry}'], pathex=[r'{root}'], excludes={excludes!r})
+
+_ecartes = {exclude_bin!r}
+a.binaries = TOC([b for b in a.binaries
+                  if not any(motif in b[0].lower() for motif in _ecartes)])
+
+pyz = PYZ(a.pure)
+exe = EXE(pyz, a.scripts, exclude_binaries=True, name='{name}',
+          console=False, debug=False, strip=False, upx=False)
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='{name}')
+"""
+
+
+def write_spec(entry: str, build_dir: str) -> str:
+    os.makedirs(build_dir, exist_ok=True)
+    path = os.path.join(build_dir, NAME + ".spec")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(SPEC_TEMPLATE.format(entry=entry, root=REPO_ROOT, name=NAME,
+                                      excludes=list(EXCLUDES),
+                                      exclude_bin=list(EXCLUDE_BINARIES)))
+    return path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Construit l'executable")
     parser.add_argument("--onefile", action="store_true",
@@ -89,19 +124,14 @@ def main() -> int:
         shutil.rmtree(build_dir, ignore_errors=True)
         shutil.rmtree(os.path.join(dist_dir, NAME), ignore_errors=True)
 
+    spec = write_spec(entry_point(), build_dir)
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm",
-        "--name", NAME,
-        "--windowed",                       # sans console: c'est une appli graphique
         "--distpath", dist_dir,
         "--workpath", build_dir,
-        "--specpath", build_dir,
-        "--onefile" if args.onefile else "--onedir",
+        spec,
     ]
-    for module in EXCLUDES:
-        cmd += ["--exclude-module", module]
-    cmd.append(entry_point())
 
     print(" ".join(cmd))
     result = subprocess.run(cmd, cwd=REPO_ROOT)

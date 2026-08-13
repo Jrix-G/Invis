@@ -87,6 +87,17 @@ def main() -> int:
         flip_h, flip_v = "h" in args.flip, "v" in args.flip
     print(f"redressement: miroir H={flip_h} V={flip_v}")
 
+    # Certaines variantes d'OpenCV sont compilees sans interface graphique.
+    # `imshow` y existe malgre tout et ne se signale qu'a l'appel, en levant
+    # une erreur: tester sa presence ne suffit donc pas, il faut l'essayer.
+    show_window = not args.no_window
+    if show_window:
+        try:
+            cv2.namedWindow("replay", cv2.WINDOW_AUTOSIZE)
+        except cv2.error:
+            show_window = False
+            print("affichage OpenCV indisponible dans cette version: sortie console")
+
     stamps = load_timestamps(args.session)
     detector = ObstacleDetector()
     detector.sensitivity = args.sensitivity
@@ -119,7 +130,7 @@ def main() -> int:
             print(f"{t:7.2f}s  {result.state:<9} {result.reason}{distance}")
             last_state = result.state
 
-        if not args.no_window:
+        if show_window:
             view = overlay.draw(bgr, result, show_flow=True, mapframe=mapframe)
             cv2.imshow("replay", cv2.resize(view, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST))
             delay = 1
@@ -130,7 +141,7 @@ def main() -> int:
         elif args.speed > 0 and i + 1 < len(stamps):
             time.sleep(max(0.0, (stamps[i + 1] - t) / args.speed))
 
-    if not args.no_window:
+    if show_window:
         cv2.destroyAllWindows()
 
     pct = 100.0 * obstacle_frames / len(frames)
