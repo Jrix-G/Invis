@@ -36,8 +36,9 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from . import config, geometry
+from . import config, geometry, loop
 from .detector import STATE_NO_FLOW, DetectionResult
+from .loop import LoopCloser
 from .fusion import ConstantVelocity, HeadingFilter, wrap_angle
 from .geometry import Intrinsics
 from .structure import RayBundle
@@ -54,6 +55,38 @@ class NearestObstacle:
     lateral_m: float
     height_m: float
     n_points: int
+
+
+@dataclass
+class ImuSample:
+    """Mesure inertielle, telle qu'un controleur de vol peut la fournir.
+
+    Tous les champs sont facultatifs, et c'est le point important: le systeme
+    fonctionne sans aucun d'eux, et se sert de chacun de ceux qui arrivent. Un
+    drone qui ne publie que son gyrometre gagne la stabilite de cap; un drone
+    qui publie aussi son assiette gagne l'immunite de la reconstruction aux
+    obstacles qui remplissent l'image.
+
+    Ce que chaque mesure apporte, et pourquoi
+    ----------------------------------------
+    `gyro_z_dps` -- vitesse de lacet. Le cap est la seule grandeur du systeme
+    que rien n'observe: il s'integre, donc il derive, et aucune image ne peut
+    le recaler sans reference exterieure. Un gyrometre ne supprime pas la
+    derive (il s'integre aussi) mais il la ramene de plusieurs degres par
+    seconde a quelques degres par minute.
+
+    `pitch_deg`, `roll_deg` -- assiette du drone, mesuree par rapport a la
+    gravite. Elle ne derive pas, elle. Fournie, elle remplace l'estimation
+    faite sur le plan du sol, qui est la partie la plus fragile de la chaine:
+    un obstacle qui remplit l'image la fausse de plusieurs degres, et chaque
+    degre coute environ dix pour cent de distance en haut d'image.
+    """
+
+    stamp: float
+    gyro_z_dps: Optional[float] = None
+    pitch_deg: Optional[float] = None
+    roll_deg: Optional[float] = None
+    gyro_sigma_dps: float = config.IMU_GYRO_SIGMA_DPS
 
 
 @dataclass
@@ -88,6 +121,11 @@ class MapFrame:
     contact_row: Optional[float] = None
     n_cloud: int = 0
     n_new_points: int = 0
+    # Reconnaissance de lieu: nombre de lieux memorises, et correction
+    # appliquee si une fermeture a eu lieu sur cette image.
+    n_places: int = 0
+    loop_shift_m: float = 0.0
+    loop_similarity: float = 0.0
 
 
 class PointCloud:
@@ -209,8 +247,30 @@ class Mapper:
             meas_sigma=config.KALMAN_YAW_SIGMA_DPS,
             gate_sigma=config.KALMAN_GATE_SIGMA)
         self._rejected_motions = 0
+        self._imu: Optional[ImuSample] = None
+        self._closer = LoopCloser()
+        self.loop_matches = 0
 
     # -- reglages ----------------------------------------------------------
+
+    def push_imu(self, sample: ImuSample) -> None:
+        """Depose la derniere mesure inertielle.
+
+        Appelable depuis n'importe quel fil et a n'importe quelle cadence: la
+        mesure est simplement conservee, et l'image suivante prend la plus
+        recente si elle est encore fraiche. Il n'y a donc rien a synchroniser,
+        et une centrale qui s'arrete ne bloque rien -- le systeme revient de
+        lui-meme a l'estimation purement visuelle.
+        """
+        self._imu = sample
+
+    def _fresh_imu(self, now: float) -> Optional[ImuSample]:
+        imu = self._imu
+        if imu is None or not math.isfinite(imu.stamp):
+            return None
+        if abs(now - imu.stamp) > config.IMU_MAX_AGE_S:
+            return None
+        return imu
 
     def reset(self) -> None:
         self.cloud.clear()
@@ -227,7 +287,10 @@ class Mapper:
         self._speed = 0.0
         self._pose_kf.reset()
         self._heading_kf.reset()
+        self._closer.reset()
         self._rejected_motions = 0
+        self.loop_matches = 0
+        self._imu = None
 
     def set_height(self, height_m: float, sigma_h_m: Optional[float] = None) -> None:
         self.height_m = max(0.05, float(height_m))
@@ -291,6 +354,12 @@ class Mapper:
         #    image ou l'obstacle est visible.
         self._ground_contact(result, frame)
 
+        # 6) Reconnaissance de lieu. Elle vient apres tout le reste: la
+        #    correction qu'elle propose porte sur la position, pas sur les
+        #    points de cette image, qui ont ete places avec la pose de
+        #    l'instant. Les points suivants, eux, beneficieront du recalage.
+        self._close_loop(result, frame)
+
         frame.nearest = self._nearest_obstacle(frame, result.timestamp)
         frame.n_cloud = len(self.cloud)
         frame.ok = True
@@ -301,6 +370,18 @@ class Mapper:
     # -- assiette ----------------------------------------------------------
 
     def _update_attitude(self, result: DetectionResult) -> None:
+        # Assiette inertielle: mesuree par rapport a la gravite, donc sans
+        # derive et sans rien devoir a l'image. Quand elle est disponible, il
+        # n'y a aucune raison de lui preferer une normale de plan estimee sur
+        # une scene qui peut etre contaminee par un obstacle.
+        imu = self._fresh_imu(result.timestamp)
+        if imu is not None and imu.pitch_deg is not None:
+            self._tilt = config.CAMERA_TILT_DEG + float(imu.pitch_deg)
+            if imu.roll_deg is not None:
+                self._roll = float(imu.roll_deg)
+            self._attitude_seen = True
+            return
+
         if not self.calibrate_attitude or result.homography is None or self._K is None:
             return
 
@@ -408,6 +489,16 @@ class Mapper:
             self._pose_kf.predict(dt)
             self._heading_kf.predict(dt)
 
+            # Gyrometre: mesure directe de la vitesse de lacet. Elle est prise
+            # avant la mesure visuelle et n'entre pas en concurrence avec elle
+            # -- le filtre les combine selon leurs bruits respectifs, et celui
+            # du gyrometre est presque dix fois plus faible.
+            imu = self._fresh_imu(result.timestamp)
+            if imu is not None and imu.gyro_z_dps is not None:
+                self._heading_kf.update_rate(float(imu.gyro_z_dps), dt,
+                                             sigma_dps=imu.gyro_sigma_dps)
+                self._yaw = self._heading_kf.yaw_rad
+
         if result.state == STATE_NO_FLOW or result.homography is None:
             if use_kf:
                 if result.state == STATE_NO_FLOW and dt > 0.0:
@@ -468,6 +559,46 @@ class Mapper:
         self._pos[2] = self.height_m
         self._push_trajectory()
         return step > 1e-4
+
+    # -- fermeture de boucle -----------------------------------------------
+
+    def _close_loop(self, result: DetectionResult, frame: MapFrame) -> None:
+        """Reconnait un lieu deja survole et en tire une mesure de position.
+
+        Le resultat n'est pas ecrit dans la position: il est remis au filtre
+        d'etat comme n'importe quelle autre mesure. C'est ce qui rend
+        l'operation sure. Une reconnaissance douteuse est ecartee par le meme
+        test de compatibilite que le reste, et une reconnaissance juste est
+        absorbee d'autant plus fort que l'odometrie avait derive -- ce que le
+        filtre sait, et qu'aucune ecriture directe ne saurait.
+        """
+        if not config.LOOP_ENABLED or result.gray is None or self._K is None:
+            return
+
+        patch = loop.ground_patch(result.gray, self._K, self.height_m,
+                                  self._tilt, self._roll, self._yaw,
+                                  size_px=config.LOOP_PATCH_PX,
+                                  span_m=config.LOOP_PATCH_SPAN_M)
+        if patch is None:
+            return
+        desc = loop.descriptor(patch, config.LOOP_DESCRIPTOR_PX)
+        if desc is None:
+            return
+
+        match = self._closer.query(patch, desc, self._pos[:2], self._yaw,
+                                   result.timestamp,
+                                   position_sigma_m=self._pose_kf.position_sigma)
+        if match is not None:
+            accepted = self._pose_kf.update_position(match.position_xy,
+                                                     config.LOOP_POSITION_SIGMA_M)
+            if accepted:
+                self.loop_matches += 1
+                self._sync_from_filters()
+                frame.loop_shift_m = match.shift_m
+                frame.loop_similarity = match.similarity
+
+        self._closer.remember(patch, desc, self._pos[:2], self._yaw, result.timestamp)
+        frame.n_places = len(self._closer)
 
     def _sync_from_filters(self) -> None:
         """Recopie l'etat filtre dans la pose exposee au reste du module."""

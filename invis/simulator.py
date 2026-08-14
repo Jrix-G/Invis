@@ -226,6 +226,27 @@ class FlightSimulator:
 
     # -- verite terrain ----------------------------------------------------
 
+    def imu(self, t: float, rng: Optional[np.random.Generator] = None,
+            gyro_sigma_dps: float = 0.8, gyro_bias_dps: float = 0.0,
+            attitude: bool = True):
+        """Mesure inertielle correspondant a cet instant.
+
+        Une centrale parfaite ne prouverait rien: le bruit et surtout le biais
+        de zero sont ce qui limite un gyrometre reel, et c'est le biais qui
+        decide s'il freine la derive de cap ou s'il en cree une nouvelle. Ils
+        sont donc simules explicitement.
+        """
+        from .mapper import ImuSample
+
+        gyro = self.yaw_rate_dps + gyro_bias_dps
+        if rng is not None and gyro_sigma_dps > 0.0:
+            gyro += float(rng.normal(0.0, gyro_sigma_dps))
+        # Ce simulateur vole a plat: l'assiette vraie du drone est nulle, la
+        # camera ne doit son inclinaison qu'a son support.
+        return ImuSample(stamp=t, gyro_z_dps=gyro,
+                         pitch_deg=0.0 if attitude else None,
+                         roll_deg=0.0 if attitude else None)
+
     def truth(self, t: float) -> WorldTruth:
         pos, _ = self.camera_pose(t)
         ranges = [w.x_m - pos[0] for w in self.walls if w.x_m - pos[0] > 0]

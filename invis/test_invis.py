@@ -532,6 +532,132 @@ def test_structure() -> None:
            f"{int(mask.sum())} points retenus")
 
 
+def test_imu_fusion() -> None:
+    """Une centrale inertielle, si elle existe, doit freiner la derive de cap.
+
+    Le cap est la seule grandeur que rien n'observe dans ce systeme: il
+    s'integre, donc il derive, et aucune image ne le recale. C'est en virage
+    que cela se voit -- le lacet visuel accumule alors son erreur a chaque
+    image. Le test compare le meme vol avec et sans gyrometre.
+    """
+    print("\n-- fusion inertielle ----------------------------------------")
+    from invis.mapper import Mapper
+    from invis.simulator import FlightSimulator, Wall
+
+    def fly(with_imu: bool):
+        sim = FlightSimulator(height_m=2.0, speed_mps=0.8, yaw_rate_dps=12.0,
+                              walls=[Wall(x_m=6.0, width_m=1.6, height_m=1.4)])
+        det = ObstacleDetector()
+        mapper = Mapper(height_m=2.0)
+        rng = np.random.default_rng(17)
+        errors = []
+        for k in range(int(6.0 * FPS_SIM)):
+            t = k / FPS_SIM
+            img = sim.render(t)
+            if with_imu:
+                # Gyrometre realiste: bruite et biaise, pas parfait.
+                mapper.push_imu(sim.imu(t, rng=rng, gyro_sigma_dps=0.8,
+                                        gyro_bias_dps=0.3, attitude=False))
+            frame = mapper.update(det.process(img, t), img)
+            errors.append(abs(frame.yaw_deg - math.degrees(sim.yaw_rad(t))))
+        return float(np.mean(errors[-10:]))
+
+    without = fly(False)
+    with_ = fly(True)
+    _check(with_ < without, "le gyrometre reduit l'erreur de cap",
+           f"{without:.2f} deg sans -> {with_:.2f} deg avec")
+    _check(with_ < 3.0, "cap tenu en virage avec gyrometre", f"{with_:.2f} deg")
+
+    # L'assiette inertielle doit rendre la reconstruction insensible a
+    # l'obstacle qui remplit l'image -- la faiblesse corrigee par ailleurs a
+    # coups de seuils devient ici sans objet.
+    sim = FlightSimulator(height_m=2.5, speed_mps=0.6,
+                          walls=[Wall(x_m=6.0, width_m=1.6, height_m=1.4)])
+    det = ObstacleDetector()
+    mapper = Mapper(height_m=2.5)
+    drift = 0.0
+    for k in range(int((5.5 / 0.6) * FPS_SIM)):
+        t = k / FPS_SIM
+        img = sim.render(t)
+        mapper.push_imu(sim.imu(t, attitude=True))
+        frame = mapper.update(det.process(img, t), img)
+        drift = max(drift, abs(frame.tilt_deg - sim.tilt_deg))
+    _check(drift < 0.01, "assiette inertielle: aucune derive de tangage",
+           f"ecart max {drift:.4f} deg")
+
+
+def test_loop_closure() -> None:
+    """Repasser au meme endroit doit recaler la position, pas la degrader.
+
+    Le vol est un cercle complet: le drone revient exactement a son point de
+    depart, ce que l'odometrie seule ignore. C'est la seule situation ou une
+    information nouvelle apparait sans nouveau capteur.
+    """
+    print("\n-- fermeture de boucle --------------------------------------")
+    from invis import config as cfg
+    from invis.loop import LoopCloser, descriptor, ground_patch
+    from invis.geometry import Intrinsics
+    from invis.mapper import Mapper
+    from invis.simulator import FlightSimulator
+
+    # 1) La vignette de sol doit etre la meme quel que soit le cap: c'est la
+    #    propriete sur laquelle repose toute la reconnaissance.
+    K = Intrinsics.from_fov(W, H)
+    rng = np.random.default_rng(4)
+    scene = cv2.GaussianBlur(rng.integers(0, 255, size=(H, W), dtype=np.uint8), (5, 5), 0)
+    p0 = ground_patch(scene, K, 2.0, -45.0, 0.0, 0.0)
+    _check(p0 is not None and float(p0.std()) > 5.0,
+           "vignette de sol construite", f"ecart-type {p0.std():.1f}" if p0 is not None else "None")
+    _check(descriptor(p0) is not None, "descripteur extrait de la vignette")
+
+    # 2) Recalage sur decalage connu, dans les deux axes.
+    closer = LoopCloser()
+    res = cfg.LOOP_PATCH_SPAN_M / cfg.LOOP_PATCH_PX
+    big = cv2.GaussianBlur(rng.integers(0, 255, size=(400, 400), dtype=np.uint8), (5, 5), 0)
+    N = cfg.LOOP_PATCH_PX
+
+    def crop(px, py):
+        x0 = int(round(200 + px / res - N / 2))
+        y0 = int(round(200 + py / res - N / 2))
+        return big[y0:y0 + N, x0:x0 + N].copy()
+
+    errs = []
+    for dx, dy in ((0.5, 0.0), (0.0, 0.5), (-0.75, 0.25), (1.0, -1.0)):
+        out = closer._align(crop(0.0, 0.0), crop(dx, dy))
+        if out is None:
+            errs.append(float("inf"))
+            continue
+        errs.append(float(np.linalg.norm(out[0] - np.array([dx, dy]))))
+    _check(max(errs) < 0.10, "decalage retrouve dans les deux axes",
+           f"erreur max {max(errs):.3f} m sur {len(errs)} essais")
+
+    # 3) Vol circulaire complet: le drone revient sur ses traces.
+    def fly(enabled: bool) -> float:
+        saved, cfg.LOOP_ENABLED = cfg.LOOP_ENABLED, enabled
+        try:
+            sim = FlightSimulator(height_m=2.0, speed_mps=0.8, yaw_rate_dps=30.0, walls=[])
+            det = ObstacleDetector()
+            mapper = Mapper(height_m=2.0)
+            turn_s = 360.0 / 30.0
+            for k in range(int(turn_s * FPS_SIM * 1.05)):
+                t = k / FPS_SIM
+                mapper.update(det.process(sim.render(t), t))
+            truth = sim.truth(t)
+            error = float(np.hypot(mapper._pos[0] - truth.camera_x,
+                                   mapper._pos[1] - truth.camera_y))
+            return error, mapper.loop_matches, len(mapper._closer)
+        finally:
+            cfg.LOOP_ENABLED = saved
+
+    without, _, _ = fly(False)
+    with_, matches, places = fly(True)
+    _check(places > 10, "lieux memorises le long du parcours", f"{places} cles")
+    _check(matches > 0, "boucle effectivement reconnue au retour",
+           f"{matches} fermetures acceptees par le filtre")
+    _check(with_ <= without, "la fermeture ne degrade jamais la position",
+           f"{without:.2f} m sans -> {with_:.2f} m avec")
+
+
 def test_attitude_robustness() -> None:
     """L'assiette ne doit pas suivre l'obstacle qui grandit dans l'image.
 
@@ -1050,6 +1176,8 @@ def main() -> int:
     test_frame_quality()
     test_fusion()
     test_structure()
+    test_imu_fusion()
+    test_loop_closure()
     test_attitude_robustness()
     test_metric_reconstruction()
     test_scale_invariance()

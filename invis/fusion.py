@@ -87,12 +87,6 @@ class ConstantVelocity:
         n = self.dim
         return float(np.sqrt(max(0.0, np.trace(self._P[:n, :n]) / n)))
 
-    def set_position(self, position: np.ndarray) -> None:
-        """Impose une position (fermeture de boucle) sans toucher a la vitesse."""
-        n = self.dim
-        self._x[:n] = np.asarray(position, dtype=np.float64).reshape(n)
-        self._P[:n, :n] *= 0.25
-
     # -- cycle -------------------------------------------------------------
 
     def predict(self, dt: float) -> None:
@@ -121,6 +115,44 @@ class ConstantVelocity:
         P[:n, n:] += q * (dt ** 3 / 2.0) * eye
         P[n:, :n] += q * (dt ** 3 / 2.0) * eye
         P[n:, n:] += q * (dt ** 2) * eye
+
+    def update_position(self, measurement: np.ndarray, sigma: float) -> bool:
+        """Corrige l'etat avec une mesure de position absolue.
+
+        C'est par la qu'entre une fermeture de boucle. La traiter comme une
+        *mesure* plutot que comme un recalage autoritaire a deux consequences
+        qui comptent: une reconnaissance de lieu douteuse est ecartee par le
+        meme test de compatibilite que le reste, et une reconnaissance juste
+        est absorbee proportionnellement a l'incertitude accumulee -- forte
+        quand l'odometrie a longtemps derive, faible quand elle vient d'etre
+        recalee. Aucune de ces deux proprietes ne s'obtient en ecrivant
+        directement dans la position.
+        """
+        n = self.dim
+        z = np.asarray(measurement, dtype=np.float64).reshape(n)
+        if not np.isfinite(z).all():
+            return False
+
+        R = (max(1e-6, float(sigma)) ** 2) * np.eye(n)
+        S = self._P[:n, :n] + R
+        try:
+            S_inv = np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            return False
+
+        innovation = z - self._x[:n]
+        d2 = float(innovation @ S_inv @ innovation)
+        if d2 > (self.gate_sigma ** 2) * n:
+            return False
+
+        K = self._P[:, :n] @ S_inv
+        self._x += K @ innovation
+        H = np.zeros((n, 2 * n))
+        H[:, :n] = np.eye(n)
+        A = np.eye(2 * n) - K @ H
+        self._P = A @ self._P @ A.T + K @ R @ K.T
+        self._P = 0.5 * (self._P + self._P.T)
+        return True
 
     def update_velocity(self, measurement: np.ndarray,
                         sigma: Optional[float] = None) -> bool:
@@ -212,21 +244,39 @@ class HeadingFilter:
         self._filter.predict(dt)
         self._yaw = wrap_angle(self._yaw + rate * dt)
 
+    def _apply(self, rate_rad_s: float, dt: float, sigma_rad_s: Optional[float]) -> bool:
+        before = self._filter.velocity[0]
+        accepted = self._filter.update_velocity(np.array([rate_rad_s]), sigma_rad_s)
+        if accepted:
+            # Le cap suit la correction apportee a la vitesse de lacet: sans
+            # cela le filtre lisserait la vitesse mais le cap resterait celui
+            # de la mesure brute, et le lissage ne servirait a rien.
+            self._yaw = wrap_angle(self._yaw + (self._filter.velocity[0] - before) * dt)
+        return accepted
+
+    def update_rate(self, rate_dps: float, dt: float,
+                    sigma_dps: Optional[float] = None) -> bool:
+        """Corrige avec une vitesse de lacet mesuree directement.
+
+        C'est la voie d'entree d'un gyrometre. Elle est distincte de
+        `update_delta` parce qu'un gyrometre mesure la vitesse elle-meme, sans
+        passer par une difference de caps: pas de repliement a gerer, pas de
+        division par dt qui amplifierait le bruit, et une precision d'un autre
+        ordre. C'est la seule mesure capable de freiner la derive de cap, que
+        rien n'observe autrement sur ce drone.
+        """
+        if dt <= 0.0:
+            return False
+        sigma = None if sigma_dps is None else np.radians(sigma_dps)
+        return self._apply(float(np.radians(rate_dps)), dt, sigma)
+
     def update_delta(self, delta_rad: float, dt: float,
                      sigma_dps: Optional[float] = None) -> bool:
         """Corrige avec un increment de cap mesure sur dt secondes."""
         if dt <= 0.0:
             return False
-        delta = wrap_angle(float(delta_rad))
         sigma = None if sigma_dps is None else np.radians(sigma_dps)
-        rate_before = self._filter.velocity[0]
-        accepted = self._filter.update_velocity(np.array([delta / dt]), sigma)
-        if accepted:
-            # Le cap suit la correction apportee a la vitesse de lacet: sans
-            # cela le filtre lisserait la vitesse mais le cap resterait celui
-            # de la mesure brute, et le lissage ne servirait a rien.
-            self._yaw = wrap_angle(self._yaw + (self._filter.velocity[0] - rate_before) * dt)
-        return accepted
+        return self._apply(wrap_angle(float(delta_rad)) / dt, dt, sigma)
 
 
 def sigma_from_parallax(depth_m: float, baseline_m: float, focal_px: float,

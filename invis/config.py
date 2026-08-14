@@ -299,6 +299,70 @@ KALMAN_ZUPT_SIGMA = 0.10
 KALMAN_ZUPT_YAW_DPS = 3.0
 
 # ---------------------------------------------------------------------------
+# Entree inertielle (facultative)
+# ---------------------------------------------------------------------------
+
+# Le systeme fonctionne sans centrale inertielle: c'est sa raison d'etre. Mais
+# si le controleur de vol en publie une, deux grandeurs valent d'etre prises.
+#
+# Bruit du gyrometre de lacet, en degres par seconde. Celui d'un MEMS de
+# petit multirotor. Compare aux ~10 deg/s de la mesure visuelle, il domine
+# largement -- c'est ce qui fait qu'il freine la derive de cap.
+IMU_GYRO_SIGMA_DPS = 1.5
+# Age au-dela duquel une mesure inertielle n'est plus utilisee, en secondes.
+# Une assiette vieille d'une demi-seconde ne decrit plus le drone: mieux vaut
+# revenir a l'estimation visuelle que de recaler sur du passe.
+IMU_MAX_AGE_S = 0.25
+
+# ---------------------------------------------------------------------------
+# Fermeture de boucle
+# ---------------------------------------------------------------------------
+
+LOOP_ENABLED = True
+# Vignette de sol redressee: taille en pixels et portee metrique. 8 m pour
+# 64 px font 12,5 cm par pixel -- la precision de recalage qu'on peut esperer.
+# Plus fin ne servirait a rien: le sol n'est pas connu a mieux que cela.
+LOOP_PATCH_PX = 64
+# 6 m pour 64 px font 9,4 cm par pixel. La portee fixe aussi le decalage
+# maximal rattrapable -- la correlation de phase repond jusqu'a environ la
+# moitie de la vignette, soit trois metres de derive.
+LOOP_PATCH_SPAN_M = 6.0
+# Descripteur: la vignette reduite. 16x16 suffit a distinguer des lieux, et
+# rend la comparaison a la memoire entiere plus rapide que le redressement.
+LOOP_DESCRIPTOR_PX = 16
+# Fraction de la vignette qui doit etre reellement observee. En dessous, la
+# vue de dessus est surtout du vide et se ressemble partout.
+#
+# Le plafond physique est bas et il faut le savoir: la vignette est centree
+# sur le drone alors que la camera ne voit qu'un trapeze devant lui. La moitie
+# arriere est structurellement vide, et le champ de 54 degres ne remplit pas
+# l'autre moitie. Mesure entre 11 % et 17 % selon l'altitude, jamais plus. Le
+# seuil est donc cale sous ce plafond, pas sur une intuition de "moitie
+# remplie".
+LOOP_MIN_COVERAGE = 0.08
+# Espacement des lieux memorises, en metres. La memoire couvre une distance,
+# pas une duree: un stationnaire n'ajoute rien.
+LOOP_KEY_SPACING_M = 0.6
+LOOP_CAPACITY = 256
+# Anciennete minimale d'un lieu pour qu'il puisse etre "reconnu". Plus recent,
+# il confirmerait l'odometrie par elle-meme au lieu de la corriger.
+LOOP_MIN_AGE_S = 8.0
+# Rayon de recherche de base, elargi ensuite par l'incertitude accumulee.
+LOOP_SEARCH_RADIUS_M = 2.0
+# Ressemblance minimale des descripteurs. Volontairement exigeante: une
+# fausse fermeture est bien plus nuisible qu'une fermeture manquee.
+LOOP_MIN_SIMILARITY = 0.55
+# Nettete du pic de correlation de phase. Un pic mou signifie que les deux
+# vignettes ne decrivent pas le meme sol, quoi qu'en dise le descripteur --
+# ou que le cap estime est trop faux pour qu'elles soient comparables. Sur des
+# decalages verifies allant jusqu'a trois metres, un vrai recouvrement donne
+# au moins 0,36; on garde de la marge pour les images reelles, plus bruitees.
+LOOP_MIN_PHASE_RESPONSE = 0.15
+# Incertitude attribuee a la position issue d'une fermeture. De l'ordre du
+# pixel de vignette: c'est la resolution du recalage, pas mieux.
+LOOP_POSITION_SIGMA_M = 0.20
+
+# ---------------------------------------------------------------------------
 # Controle de qualite des images
 # ---------------------------------------------------------------------------
 

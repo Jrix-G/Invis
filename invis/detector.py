@@ -80,6 +80,11 @@ class DetectionResult:
     off_plane: Optional[np.ndarray] = None     # (N,) booleen "hors sol"
     homography: Optional[np.ndarray] = None    # plan dominant, pixels travail
     work_size: Tuple[int, int] = (0, 0)        # (largeur, hauteur) de travail
+    # Image de travail en niveaux de gris, deja egalisee et lissee. Publiee
+    # parce que la reconnaissance de lieu en a besoin exactement sous cette
+    # forme: la recalculer couterait une conversion et un redimensionnement
+    # par image pour un resultat identique.
+    gray: Optional[np.ndarray] = None
     residual_threshold: float = 0.0
     plane_inlier_ratio: float = 0.0
 
@@ -217,6 +222,7 @@ class ObstacleDetector:
         result.horizon_row = horizon_row(bgr.shape[0])
         result.timestamp = timestamp
         result.work_size = (w, h)
+        result.gray = gray
         if self._K is None or self._K.width != w or self._K.height != h:
             self._K = Intrinsics.from_fov(w, h)
 
