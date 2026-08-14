@@ -117,8 +117,25 @@ EXCLUDE_BINARIES = (
     "opencv_videoio_ffmpeg",
 )
 
+# `invis/version.py` doit exister comme *fichier* dans le bundle, en plus
+# d'etre compile dans l'archive PYZ.
+#
+# Ce n'est pas une redondance. `invis_bootstrap.bundled_version()` lit ce
+# fichier en texte, sans l'importer -- volontairement: importer executerait du
+# code avant d'avoir decide s'il faut lui faire confiance. Or PyInstaller ne
+# livre aucune source .py par defaut. Le fichier etait donc introuvable, la
+# lecture echouait, `activate()` renvoyait None, et le code mis a jour n'etait
+# JAMAIS place devant le code embarque: les mises a jour s'installaient dans
+# l'espace utilisateur puis dormaient, sans effet, sur les executables 1.0.0 a
+# 1.0.4. Le test de demarrage ne le voyait pas: il fabriquait lui-meme un
+# bundle contenant ce fichier, donc une disposition que la construction reelle
+# ne produisait pas.
+DATA_FILES = (
+    (os.path.join("invis", "version.py"), "invis"),
+)
+
 SPEC_TEMPLATE = """# -*- mode: python ; coding: utf-8 -*-
-a = Analysis([r'{entry}'], pathex=[r'{root}'],
+a = Analysis([r'{entry}'], pathex=[r'{root}'], datas={datas!r},
              hiddenimports=['invis_bootstrap'], excludes={excludes!r})
 
 _ecartes = {exclude_bin!r}
@@ -141,7 +158,9 @@ def write_spec(entry: str, build_dir: str) -> str:
         # le binaire Windows equivalent. Sous Windows l'operation n'apporte
         # rien et peut abimer certaines DLL: on ne l'y applique pas.
         strip = sys.platform != "win32"
+        datas = [(os.path.join(REPO_ROOT, src), dest) for src, dest in DATA_FILES]
         fh.write(SPEC_TEMPLATE.format(entry=entry, root=REPO_ROOT, name=NAME,
+                                      datas=datas,
                                       excludes=list(EXCLUDES),
                                       exclude_bin=list(EXCLUDE_BINARIES),
                                       strip=strip))

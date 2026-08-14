@@ -1547,6 +1547,22 @@ def test_bootstrap() -> None:
         bs.data_dir = lambda app_name=None: os.path.join(work, "inexistant")
         _check(bs.activate(bundle_root=bundle) is None,
                "dossier absent -> repli silencieux, pas d'erreur")
+
+        # Le bundle fabrique ci-dessus est fabrique *par le test*: il contient
+        # invis/version.py parce que le test l'y a ecrit. La construction
+        # reelle, elle, ne livrait aucune source .py -- PyInstaller compile le
+        # paquet dans une archive PYZ. Tout ce qui precede passait donc au vert
+        # sur une disposition que l'executable distribue ne produisait jamais,
+        # et les mises a jour dormaient sans effet sur les versions 1.0.0 a
+        # 1.0.4. On verifie donc aussi la recette de construction, pas
+        # seulement la logique.
+        from invis import build_app
+        spec_dir = os.path.join(work, "spec")
+        spec = build_app.write_spec(os.path.join(work, "entree.py"), spec_dir)
+        declared = open(spec, encoding="utf-8").read()
+        _check("version.py" in declared and "datas=" in declared,
+               "la construction livre invis/version.py comme fichier",
+               "sinon bundled_version() renvoie None et la mise a jour est inerte")
     finally:
         bs.data_dir = saved_dir
         sys.path[:] = saved_path

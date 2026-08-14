@@ -10,8 +10,8 @@ detection and live 3D reconstruction of the scene, from a single camera.
 ### Linux
 
 ```bash
-wget https://github.com/Jrix-G/Invis/releases/latest/download/Invis-1.0.3-linux-x86_64.tar.gz
-tar xzf Invis-1.0.3-linux-x86_64.tar.gz
+wget https://github.com/Jrix-G/Invis/releases/download/v1.0.5/Invis-1.0.5-linux-x86_64.tar.gz
+tar xzf Invis-1.0.5-linux-x86_64.tar.gz
 ./Invis/Invis
 ```
 
@@ -28,7 +28,7 @@ sudo apt install libgl1 libglib2.0-0
 ### Windows
 
 Download
-[`Invis-1.0.3-windows.zip`](https://github.com/Jrix-G/Invis/releases/latest),
+[`Invis-1.0.5-windows.zip`](https://github.com/Jrix-G/Invis/releases/latest),
 unzip, run `Invis.exe`.
 
 Windows will show *"Windows protected your PC"* on first launch: click **More

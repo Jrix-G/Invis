@@ -12,8 +12,8 @@
 
 | | |
 |---|---|
-| 🐧 **Linux** | `wget …/Invis-latest-linux.tar.gz && tar xzf … && ./Invis/Invis` |
-| 🪟 **Windows** | Grab `Invis-1.0.3-windows.zip`, unzip, run `Invis.exe` |
+| 🐧 **Linux** | `wget …/Invis-1.0.5-linux-x86_64.tar.gz && tar xzf … && ./Invis/Invis` |
+| 🪟 **Windows** | Grab `Invis-1.0.5-windows.zip`, unzip, run `Invis.exe` |
 | 🛸 **No drone** | `Source → sim → Connect` |
 
 Set the **flight height** before anything else — every distance is proportional to it.
