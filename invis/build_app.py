@@ -59,6 +59,33 @@ import sys
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
+    # OpenCV echoue au chargement sur les editions Windows N/KN (frequentes en
+    # Europe) : ces editions n'incluent pas le Media Feature Pack dont
+    # dependent les DLL Windows Media Foundation (mfplat.dll, MFReadWrite.dll)
+    # qu'OpenCV lie en dur. L'echec ressemble alors a un plantage
+    # incomprehensible ("DLL load failed") sans rapport apparent avec la
+    # cause. On le detecte tot pour afficher un message exploitable plutot que
+    # la trace PyInstaller brute.
+    try:
+        import cv2  # noqa: F401
+    except ImportError as exc:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "Invis -- composant Windows manquant",
+            "Le demarrage a echoue car un composant video de Windows est "
+            "absent (" + str(exc) + ").\\n\\n"
+            "Cause frequente : les editions Windows N/KN (installees par "
+            "defaut dans certains pays d'Europe) n'incluent pas le lecteur "
+            "multimedia dont Invis a besoin.\\n\\n"
+            "Solution : installer le \\"Media Feature Pack\\" pour votre "
+            "edition de Windows depuis le site de Microsoft, puis relancer "
+            "Invis."
+        )
+        sys.exit(1)
+
     # Choisir le code a executer AVANT d'importer le paquet. Des que `invis`
     # est importe, son emplacement est fixe: une mise a jour installee ne
     # serait alors jamais chargee, et le mecanisme entier resterait inerte.

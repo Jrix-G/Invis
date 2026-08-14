@@ -11,8 +11,8 @@ camera.
 ### Linux
 
 ```bash
-wget https://github.com/Jrix-G/Invis/releases/latest/download/Invis-1.0.1-linux-x86_64.tar.gz
-tar xzf Invis-1.0.1-linux-x86_64.tar.gz
+wget https://github.com/Jrix-G/Invis/releases/latest/download/Invis-1.0.3-linux-x86_64.tar.gz
+tar xzf Invis-1.0.3-linux-x86_64.tar.gz
 ./Invis/Invis
 ```
 
@@ -29,12 +29,18 @@ sudo apt install libgl1 libglib2.0-0
 ### Windows
 
 Telecharger
-[`Invis-1.0.1-windows.zip`](https://github.com/Jrix-G/Invis/releases/latest),
+[`Invis-1.0.3-windows.zip`](https://github.com/Jrix-G/Invis/releases/latest),
 decompresser, lancer `Invis.exe`.
 
 Windows affichera *« Windows a protege votre ordinateur »* au premier
 lancement: cliquer sur **Informations complementaires** puis **Executer quand
 meme**. L'application n'est pas signee numeriquement.
+
+Si le programme refuse de demarrer avec une erreur `DLL load failed` liee a
+`cv2`: c'est une edition Windows N/KN (installee par defaut dans certains
+pays d'Europe), qui n'inclut pas le lecteur multimedia dont Invis a besoin.
+Installer le *Media Feature Pack* correspondant a votre edition de Windows
+depuis le site de Microsoft regle le probleme.
 
 ### Puis, dans l'application
 

@@ -10,8 +10,8 @@ detection and live 3D reconstruction of the scene, from a single camera.
 ### Linux
 
 ```bash
-wget https://github.com/Jrix-G/Invis/releases/latest/download/Invis-1.0.1-linux-x86_64.tar.gz
-tar xzf Invis-1.0.1-linux-x86_64.tar.gz
+wget https://github.com/Jrix-G/Invis/releases/latest/download/Invis-1.0.3-linux-x86_64.tar.gz
+tar xzf Invis-1.0.3-linux-x86_64.tar.gz
 ./Invis/Invis
 ```
 
@@ -28,11 +28,17 @@ sudo apt install libgl1 libglib2.0-0
 ### Windows
 
 Download
-[`Invis-1.0.1-windows.zip`](https://github.com/Jrix-G/Invis/releases/latest),
+[`Invis-1.0.3-windows.zip`](https://github.com/Jrix-G/Invis/releases/latest),
 unzip, run `Invis.exe`.
 
 Windows will show *"Windows protected your PC"* on first launch: click **More
 info** then **Run anyway**. The application is not code-signed.
+
+If the program fails to start with a `DLL load failed` error mentioning
+`cv2`: this is a Windows N/KN edition (shipped by default in some European
+countries), which does not include the media player component Invis needs.
+Installing the *Media Feature Pack* for your Windows edition from Microsoft's
+site fixes it.
 
 ### Then, inside the application
 
