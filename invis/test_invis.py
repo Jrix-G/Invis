@@ -13,6 +13,7 @@ rotation, cause classique de fausse alarme en flux optique.
 from __future__ import annotations
 
 import http.server
+import math
 import os
 import socketserver
 import sys
@@ -406,6 +407,156 @@ def test_metric_reconstruction() -> None:
         _check(drift < 0.35, f"odometrie ({tag})",
                f"{odo[-1][0]:.2f} m estime contre {odo[-1][1]:.2f} m, derive {drift:.0%}")
         _check(len(mapper.cloud) > 500, f"nuage alimente ({tag})", f"{len(mapper.cloud)} pts")
+
+
+def test_fusion() -> None:
+    """Le filtre doit lisser le bruit, rejeter l'aberrant, arreter la derive."""
+    print("\n-- filtrage de la pose --------------------------------------")
+    from invis.fusion import ConstantVelocity, HeadingFilter, wrap_angle
+
+    rng = np.random.default_rng(11)
+    dt, truth_v = 0.15, np.array([0.8, 0.0])
+
+    # 1) Bruit: la vitesse filtree doit etre plus proche du vrai que la mesure.
+    kf = ConstantVelocity(dim=2, accel_sigma=1.5, meas_sigma=0.30)
+    raw_err, filt_err = [], []
+    for _ in range(120):
+        z = truth_v + rng.normal(0.0, 0.30, size=2)
+        kf.predict(dt)
+        kf.update_velocity(z)
+        raw_err.append(np.linalg.norm(z - truth_v))
+        filt_err.append(np.linalg.norm(kf.velocity - truth_v))
+    gain = float(np.mean(raw_err) / max(1e-9, np.mean(filt_err)))
+    # Le gain est borne par le bruit de modele, et c'est voulu: avec une
+    # acceleration possible de 1,5 m/s^2 sur 0,15 s, le modele lui-meme laisse
+    # filer 0,22 m/s entre deux images, contre 0,30 m/s de bruit de mesure. Le
+    # filtre moyenne donc environ trois mesures, soit un facteur racine de
+    # trois. Exiger davantage reviendrait a pretendre que le drone
+    # n'accelere pas -- le filtre suivrait alors mal les vraies variations.
+    _check(gain > 1.5, "bruit de vitesse reduit par le filtre",
+           f"erreur divisee par {gain:.1f} (borne modele ~1.7)")
+
+    # 2) Aberrant: une mesure incompatible est ecartee, pas moyennee.
+    accepted = kf.update_velocity(np.array([12.0, -9.0]))
+    _check(not accepted, "mesure aberrante rejetee par le test de compatibilite")
+    _check(np.linalg.norm(kf.velocity - truth_v) < 0.2,
+           "l'etat survit intact au rejet", f"v={np.round(kf.velocity, 3)}")
+
+    # 3) Stationnaire: la vitesse nulle observee doit stopper l'etat.
+    for _ in range(12):
+        kf.predict(dt)
+        kf.update_velocity(np.zeros(2), sigma=0.10)
+    _check(kf.speed < 0.08, "vitesse nulle observee -> etat immobilise",
+           f"{kf.speed:.3f} m/s")
+
+    # 4) L'incertitude de position doit croitre: rien ne l'observe.
+    free = ConstantVelocity(dim=2)
+    before = free.position_sigma
+    for _ in range(80):
+        free.predict(dt)
+    _check(free.position_sigma > before + 0.5,
+           "incertitude de position croissante sans recalage",
+           f"{before:.3f} -> {free.position_sigma:.2f} m")
+
+    # 5) Cap: le repliement doit etre correct au passage de +/-180 degres.
+    heading = HeadingFilter()
+    heading.set_yaw(math.radians(179.0))
+    for _ in range(20):
+        heading.predict(dt)
+        heading.update_delta(math.radians(1.0), dt)
+    _check(abs(heading.yaw_rad) > math.radians(150.0),
+           "cap replie correctement au passage de 180 degres",
+           f"{math.degrees(heading.yaw_rad):+.1f} deg")
+    _check(abs(wrap_angle(math.radians(370.0)) - math.radians(10.0)) < 1e-9,
+           "repliement d'angle exact")
+
+
+def test_structure() -> None:
+    """Intersection de visees: exacte sans bruit, incertitude coherente."""
+    print("\n-- structure par visees multiples ---------------------------")
+    from invis import geometry
+    from invis.geometry import Intrinsics
+    from invis.structure import RayBundle
+
+    K = Intrinsics.from_fov(W, H)
+    tilt, height = -45.0, 2.5
+    R_bc = geometry.body_from_camera(tilt, 0.0)
+    truth = np.array([[6.0, 0.0, 1.4], [6.0, 0.5, 0.9], [5.0, -0.3, 0.6]])
+    ids = np.arange(len(truth))
+
+    def fly(bundle, steps, noise_px=0.0, rng=None):
+        out = None
+        for k in range(steps):
+            pos = np.array([0.09 * k, 0.0, height])
+            cam = (truth - pos) @ R_bc
+            uv = np.column_stack([cam[:, 0] / cam[:, 2] * K.fx + K.cx,
+                                  cam[:, 1] / cam[:, 2] * K.fy + K.cy])
+            if noise_px and rng is not None:
+                uv = uv + rng.normal(0.0, noise_px, size=uv.shape)
+            rays = geometry.rays_body(uv, K, R_bc)
+            rows = bundle.observe(ids, pos, rays)
+            out = bundle.solve(rows, min_views=3, max_sigma_m=1e9, focal_px=K.fx)
+        return out
+
+    X, sigma, _ = fly(RayBundle(capacity=32, sigma_px=0.6), 10)
+    err = np.linalg.norm(X - truth, axis=1)
+    _check(float(err.max()) < 1e-6, "visees exactes -> point exact",
+           f"erreur max {err.max():.2e} m")
+
+    # L'incertitude doit decroitre quand la base s'allonge, et le faire de
+    # facon monotone: c'est ce qui la rend utilisable comme critere.
+    short = fly(RayBundle(capacity=32, sigma_px=0.6), 4)[1]
+    long_ = fly(RayBundle(capacity=32, sigma_px=0.6), 14)[1]
+    _check(bool(np.all(long_ < short)), "incertitude decroissante avec la base",
+           f"{np.round(short, 3)} -> {np.round(long_, 3)}")
+
+    # Avec du bruit de pointage, l'erreur reelle doit rester du meme ordre que
+    # l'incertitude annoncee. Une incertitude qui ne predit pas l'erreur ne
+    # sert a rien -- pire, elle donne une confiance imméritee.
+    rng = np.random.default_rng(5)
+    Xn, sn, _ = fly(RayBundle(capacity=32, sigma_px=0.6), 14, noise_px=0.6, rng=rng)
+    real = np.linalg.norm(Xn - truth, axis=1)
+    _check(bool(np.all(real < 3.0 * sn)), "erreur reelle compatible avec l'incertitude",
+           f"erreur {np.round(real, 3)} contre sigma {np.round(sn, 3)}")
+
+    # Deux visees quasi confondues ne doivent rien produire de credible.
+    still = RayBundle(capacity=32, sigma_px=0.6)
+    for _ in range(6):
+        pos = np.array([0.0, 0.0, height])
+        cam = (truth - pos) @ R_bc
+        uv = np.column_stack([cam[:, 0] / cam[:, 2] * K.fx + K.cx,
+                              cam[:, 1] / cam[:, 2] * K.fy + K.cy])
+        rows = still.observe(ids, pos, geometry.rays_body(uv, K, R_bc))
+    _, _, mask = still.solve(rows, min_views=3, max_sigma_m=0.6, focal_px=K.fx)
+    _check(not mask.any(), "aucune base -> aucun point accepte",
+           f"{int(mask.sum())} points retenus")
+
+
+def test_attitude_robustness() -> None:
+    """L'assiette ne doit pas suivre l'obstacle qui grandit dans l'image.
+
+    Un mur encore lointain se plie a l'homographie du sol -- sa parallaxe est
+    trop faible pour l'en distinguer -- tout en tirant la normale ajustee vers
+    lui. Le tangage derivait ainsi de plusieurs degres pendant l'approche, ce
+    qui se payait en dizaines de centimetres sur la distance annoncee.
+    """
+    print("\n-- stabilite de l'assiette ----------------------------------")
+    from invis.mapper import Mapper
+    from invis.simulator import FlightSimulator, Wall
+
+    sim = FlightSimulator(height_m=2.5, speed_mps=0.6,
+                          walls=[Wall(x_m=6.0, width_m=1.6, height_m=1.4)])
+    det = ObstacleDetector()
+    mapper = Mapper(height_m=2.5)
+    tilts = []
+    for k in range(int((5.5 / 0.6) * FPS_SIM)):
+        t = k / FPS_SIM
+        img = sim.render(t)
+        tilts.append(mapper.update(det.process(img, t), img).tilt_deg)
+
+    drift = max(abs(v - sim.tilt_deg) for v in tilts)
+    _check(drift < 1.5, "tangage stable pendant toute l'approche",
+           f"ecart max {drift:.2f} deg (mesure a 4.5 deg avant durcissement)")
 
 
 def test_scale_invariance() -> None:
@@ -897,6 +1048,9 @@ def main() -> int:
     test_pose_convention()
     test_detector()
     test_frame_quality()
+    test_fusion()
+    test_structure()
+    test_attitude_robustness()
     test_metric_reconstruction()
     test_scale_invariance()
     test_rendering()

@@ -111,7 +111,7 @@ RESIDUAL_FLOW_RATIO = 0.5
 
 # Fraction minimale de points compatibles avec le plan pour croire que le plan
 # trouve est bien le sol. En dessous, l'homographie a probablement accroche un
-# mur ou un objet plat: on ne s'en sert pas pour recalibrer l'assiette.
+# mur ou un objet plat.
 PLANE_INLIER_MIN_RATIO = 0.5
 # Nombre minimal de points pour tenter un modele plan.
 MIN_POINTS_FOR_MODEL = 12
@@ -173,6 +173,13 @@ ATTITUDE_SMOOTHING = 0.25
 # Ecart maximal accepte par rapport a l'inclinaison nominale, en degres.
 # Au-dela on considere que l'homographie n'a pas trouve le sol.
 ATTITUDE_MAX_DEVIATION_DEG = 25.0
+# Conditions exigees pour qu'une image serve a mesurer l'assiette. Bien plus
+# strictes que celles qui suffisent a exploiter le plan par ailleurs, et pour
+# une raison precise: un mur lointain se confond avec le sol dans
+# l'homographie, mais il suffit a faire pencher la normale ajustee. Voir le
+# commentaire detaille dans Mapper._update_attitude.
+ATTITUDE_MIN_INLIER_RATIO = 0.95
+ATTITUDE_MAX_OFF_PLANE = 0.03
 
 # Mesure par point de contact au sol.
 MIN_CONTACT_POINTS = 5
@@ -184,12 +191,38 @@ CONTACT_COLUMN_BAND = 0.22
 # que la mesure ne vaut plus grand-chose.
 CONTACT_EXTRAPOLATION_LIMIT = 1.35
 
-# Odometrie visuelle / triangulation.
-# Angle minimal entre les deux rayons, en degres. Sous cet angle la
-# triangulation est mal conditionnee et produit des points aberrants.
-MIN_PARALLAX_DEG = 1.2
-# Distance au-dela de laquelle un point triangule est juge non fiable.
+# Distance au-dela de laquelle un point reconstruit est juge non fiable.
 MAX_POINT_RANGE_M = 30.0
+
+# ---------------------------------------------------------------------------
+# Structure par intersection de rayons multi-vues
+# ---------------------------------------------------------------------------
+
+# Nombre de visees avant d'accepter un point. Deux suffisent geometriquement,
+# mais deux visees consecutives sont presque paralleles: la troisieme est ce
+# qui fait passer d'une profondeur devinee a une profondeur mesuree.
+STRUCTURE_MIN_VIEWS = 3
+# Incertitude au-dela de laquelle le point est ecarte, en metres. Ce seuil
+# remplace l'angle de parallaxe minimal: il porte sur la grandeur qui compte
+# vraiment, l'erreur attendue en metres, et non sur un intermediaire.
+STRUCTURE_MAX_SIGMA_M = 0.60
+# Precision de pointage d'un detail dans l'image, en pixels. C'est elle qui
+# fixe l'echelle de toutes les incertitudes calculees.
+STRUCTURE_SIGMA_PX = 0.6
+# Nombre de points suivis dont l'accumulation est conservee.
+STRUCTURE_CAPACITY = 4096
+# Fenetre d'oubli des visees, en images. Elle borne l'influence des
+# observations anciennes, prises depuis une pose plus derivee et sur un point
+# suivi qui a pu glisser entre-temps.
+STRUCTURE_WINDOW = 12.0
+# Hauteur minimale au-dessus du sol pour qu'un point compte comme obstacle.
+# En dessous, c'est du relief de terrain: un caillou, une bosse, une marque de
+# peinture mal ajustee par l'homographie. Un drone ne s'en preoccupe pas, et
+# les inclure fausse la distance annoncee vers le bas.
+OBSTACLE_MIN_HEIGHT_M = 0.15
+# Le seuil monte aussi avec l'incertitude du point: un point qui ne depasse
+# pas sa propre barre d'erreur n'a pas prouve qu'il n'etait pas au sol.
+OBSTACLE_HEIGHT_SIGMA_K = 1.0
 
 # Lecture de l'obstacle le plus proche.
 # Duree pendant laquelle un point triangule reste pris en compte.
@@ -197,6 +230,10 @@ OBSTACLE_MEMORY_S = 2.0
 # Demi-largeur du couloir devant le drone, en metres.
 OBSTACLE_CORRIDOR_M = 1.5
 MIN_OBSTACLE_POINTS = 6
+# Incertitude au-dela de laquelle un point n'entre pas dans le calcul de la
+# distance. Un point mal situe ne rend pas la mesure "un peu moins precise":
+# s'il est loin devant les autres, il deplace le quantile a lui seul.
+OBSTACLE_MAX_SIGMA_M = 0.35
 # Quantile de distance retenu. Le minimum d'un nuage bruite est un aberrant
 # par construction; un quantile bas donne la meme information sans le sursaut.
 OBSTACLE_RANGE_QUANTILE = 0.15
@@ -218,12 +255,6 @@ CELL_NAMES = [
     ["BG", "BC", "BD"],
 ]
 
-# Mediane glissante des profondeurs par point suivi. Une base courte donne une
-# profondeur bruitee; repeter la mesure sur quelques images et en prendre la
-# mediane recupere l'essentiel de la precision perdue.
-DEPTH_HISTORY = 7
-DEPTH_MIN_SAMPLES = 3
-
 # Ressemblance minimale entre la normale trouvee et celle attendue pour le sol
 # (produit scalaire). En dessous, le plan ajuste n'est pas le sol et la pose
 # qui en decoule n'a pas de sens.
@@ -238,6 +269,34 @@ RANGE_TICKS_M = (1.0, 2.0, 3.0, 4.0, 6.0)
 FLOW_TARGET_PX = 14.0
 # Vitesse au-dela de laquelle l'estimation est jugee fausse, en m/s.
 MAX_SPEED_MPS = 3.0
+
+# ---------------------------------------------------------------------------
+# Filtrage de la pose
+# ---------------------------------------------------------------------------
+
+# Le filtre remplace l'integration directe du deplacement mesure. Desactivable
+# pour comparer, mais il n'y a pas de raison de s'en priver: il coute quelques
+# dizaines d'operations par image et supprime l'essentiel du bruit d'odometrie.
+KALMAN_ENABLED = True
+# Acceleration possible du drone, en m/s^2. C'est ce qui dit au filtre a quel
+# point la vitesse peut changer entre deux images: trop bas, il ignore les
+# vraies accelerations; trop haut, il ne filtre plus rien.
+KALMAN_ACCEL_SIGMA = 1.5
+# Bruit de la mesure de vitesse issue de l'homographie, en m/s.
+KALMAN_VELOCITY_SIGMA = 0.30
+# Seuil de rejet, en ecarts-types. Au-dela, la mesure est jugee incompatible
+# avec l'etat et ecartee: c'est le vrai garde-fou contre une homographie
+# ajustee sur un mur.
+KALMAN_GATE_SIGMA = 3.5
+# Meme reglage pour le cap, en degres par seconde.
+KALMAN_YAW_ACCEL_DPS2 = 60.0
+KALMAN_YAW_SIGMA_DPS = 10.0
+# Vitesse nulle observee. Une scene immobile n'est pas une absence de mesure:
+# c'est la mesure "je ne bouge pas", et c'est l'une des plus fiables du
+# systeme. L'exploiter empeche la vitesse filtree de continuer sur sa lancee
+# pendant un stationnaire.
+KALMAN_ZUPT_SIGMA = 0.10
+KALMAN_ZUPT_YAW_DPS = 3.0
 
 # ---------------------------------------------------------------------------
 # Controle de qualite des images

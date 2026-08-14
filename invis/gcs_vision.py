@@ -437,7 +437,7 @@ class VisionApp(tk.Tk):
             else:
                 try:
                     result = self.detector.process(bgr, frame.recv_time)
-                    mapframe = self.mapper.update(result)
+                    mapframe = self.mapper.update(result, bgr)
                 except cv2.error as exc:
                     self.log(f"analyse en echec: {exc}")
                     self.detector.reset()
