@@ -259,10 +259,10 @@ class ElevationGrid:
         centres[:, 1] = self.origin[1] + (iy + 0.5) * self.res
         centres[:, 2] = self.height[idx]
 
-        shade = self._shading()[idx]
+        shade = self.shading()[idx]
         return centres, self.colour[idx], shade
 
-    def _shading(self) -> np.ndarray:
+    def shading(self) -> np.ndarray:
         """Eclairement lambertien d'une lumiere fixe, oblique.
 
         Le calcul est restreint a l'emprise reellement renseignee et garde en

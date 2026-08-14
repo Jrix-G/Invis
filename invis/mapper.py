@@ -61,6 +61,30 @@ class NearestObstacle:
 
 
 @dataclass
+class ObstacleCluster:
+    """Un objet distinct devant le drone, et ce qu'on en sait.
+
+    La difference avec `NearestObstacle` n'est pas cosmetique. Celui-ci
+    resumait toute la scene a un seul chiffre, ce qui suffit a dire "quelque
+    chose approche" mais pas a repondre a la question que se pose un pilote:
+    *combien* d'obstacles, *ou*, et lequel me concerne. Deux poteaux de part et
+    d'autre du couloir donnaient la meme lecture qu'un mur en travers.
+    """
+
+    range_m: float
+    forward_m: float
+    lateral_m: float
+    width_m: float
+    height_m: float
+    n_points: int
+    sigma_m: float
+    # Boite englobante dans l'image, en pixels de travail.
+    bbox: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    # L'objet coupe-t-il le couloir de vol.
+    in_corridor: bool = False
+
+
+@dataclass
 class ImuSample:
     """Mesure inertielle, telle qu'un controleur de vol peut la fournir.
 
@@ -120,6 +144,14 @@ class MapFrame:
 
     nearest: Optional[NearestObstacle] = None
     contact: Optional[NearestObstacle] = None
+    clusters: List["ObstacleCluster"] = field(default_factory=list)
+    # Sonde droit devant: distance au premier obstacle du couloir, ou a defaut
+    # au sol vise par l'axe de la camera.
+    forward_m: float = float("nan")
+    forward_is_obstacle: bool = False
+    # Niveau d'alerte de proximite: 0 libre, 1 vigilance, 2 danger.
+    alert_level: int = 0
+    alert_reason: str = ""
     contact_uv: Optional[np.ndarray] = None
     contact_row: Optional[float] = None
     n_cloud: int = 0
@@ -380,6 +412,13 @@ class Mapper:
         self._close_loop(result, frame)
 
         frame.nearest = self._nearest_obstacle(frame, result.timestamp)
+
+        # 7) Lecture pour le pilote: objets distincts, distance droit devant,
+        #    niveau d'alerte. Tout en decoule, rien ne le precede.
+        frame.clusters = self._cluster_obstacles(frame)
+        self._probe_forward(frame)
+        self._raise_alert(frame, result)
+
         frame.n_cloud = len(self.cloud)
         frame.n_cells = len(self.grid)
         frame.ok = True
@@ -918,6 +957,154 @@ class Mapper:
         self.cloud.add(world.astype(np.float32), KIND_OBSTACLE, result.timestamp,
                        sigma=sigma, bgr=colours)
         frame.n_new_points += len(world)
+
+    def _cluster_obstacles(self, frame: MapFrame) -> List[ObstacleCluster]:
+        """Separe les points de relief en objets distincts.
+
+        Le regroupement se fait dans le plan horizontal du repere drone, pas
+        dans l'image. C'est la difference qui compte: deux objets a des
+        distances differentes se superposent souvent dans l'image et forment un
+        seul amas apparent, alors qu'ils sont nettement separes en distance --
+        et c'est la distance qui interesse le pilote.
+
+        La methode est une carte d'occupation en vue de dessus, fermee par une
+        dilatation puis etiquetee en composantes connexes. Tout tient en deux
+        appels OpenCV, donc en temps proportionnel au nombre de cases, sans
+        aucune boucle sur les points ni aucun calcul de distances deux a deux.
+        """
+        body = frame.obstacle_body
+        if body is None or len(body) < config.CLUSTER_MIN_POINTS:
+            return []
+
+        res = config.CLUSTER_RES_M
+        reach = config.MAX_POINT_RANGE_M
+        cols = int(2 * reach / res)
+        rows = int(reach / res)
+        ix = np.floor(body[:, 0] / res).astype(np.int32)
+        iy = np.floor((body[:, 1] + reach) / res).astype(np.int32)
+        inside = (ix >= 0) & (ix < rows) & (iy >= 0) & (iy < cols)
+        if inside.sum() < config.CLUSTER_MIN_POINTS:
+            return []
+
+        occupancy = np.zeros((rows, cols), dtype=np.uint8)
+        occupancy[ix[inside], iy[inside]] = 255
+        # Fermeture: deux mesures du meme objet peuvent tomber dans des cases
+        # non adjacentes, un objet fin en particulier. Sans ce pontage, un seul
+        # poteau se compterait comme trois obstacles.
+        k = config.CLUSTER_BRIDGE_CELLS
+        if k > 0:
+            occupancy = cv2.dilate(occupancy, np.ones((2 * k + 1, 2 * k + 1), np.uint8))
+
+        n_labels, labels = cv2.connectedComponents(occupancy, connectivity=8)
+        if n_labels <= 1:
+            return []
+
+        tag = np.zeros(len(body), dtype=np.int32)
+        tag[inside] = labels[ix[inside], iy[inside]]
+
+        uv = frame.obstacle_uv
+        sigma = frame.obstacle_sigma
+        clusters: List[ObstacleCluster] = []
+        for label in range(1, n_labels):
+            sel = np.flatnonzero(tag == label)
+            if len(sel) < config.CLUSTER_MIN_POINTS:
+                continue
+            pts = body[sel]
+            rng = np.hypot(pts[:, 0], pts[:, 1])
+            # Quantile bas et non minimum: le point le plus proche d'un nuage
+            # bruite est un aberrant par construction.
+            r = float(np.quantile(rng, config.OBSTACLE_RANGE_QUANTILE))
+            lateral = float(np.median(pts[:, 1]))
+            width = float(np.ptp(pts[:, 1]))
+            half = config.OBSTACLE_CORRIDOR_M
+            clusters.append(ObstacleCluster(
+                range_m=r,
+                forward_m=float(np.median(pts[:, 0])),
+                lateral_m=lateral,
+                width_m=width,
+                height_m=float(np.max(pts[:, 2]) + self.height_m),
+                n_points=int(len(sel)),
+                sigma_m=float(np.median(sigma[sel])) if sigma is not None else 0.0,
+                bbox=self._bbox_of(uv, sel),
+                # Le couloir est teste sur l'*etendue* de l'objet, pas sur son
+                # centre: un mur oblique dont le centre est a cote traverse
+                # quand meme la trajectoire.
+                in_corridor=bool(np.min(pts[:, 1]) < half and np.max(pts[:, 1]) > -half),
+            ))
+
+        clusters.sort(key=lambda c: c.range_m)
+        return clusters[:config.CLUSTER_MAX]
+
+    def _probe_forward(self, frame: MapFrame) -> None:
+        """Distance droit devant: la question la plus simple qu'on puisse poser.
+
+        Toutes les mesures existantes repondaient a "y a-t-il un obstacle
+        quelque part", jamais a "qu'y a-t-il exactement devant moi, et a quelle
+        distance". Ce sont deux questions differentes, et la seconde est celle
+        qu'un pilote pose.
+
+        La reponse est le premier objet qui coupe le couloir de vol. S'il n'y
+        en a aucun, ce n'est pas une absence de reponse: c'est *jusqu'ou* la
+        voie est degagee, c'est-a-dire aussi loin que la camera porte.
+
+        Ce second cas a demande une correction. La premiere version visait le
+        sol sous l'axe optique, ce qui donne toujours a peu pres la hauteur de
+        vol divisee par la tangente du piquage -- deux metres ici, quelle que
+        soit la scene. Un nombre constant n'informe de rien. Ce que le pilote
+        veut savoir, c'est la distance au-dela de laquelle on ne garantit plus
+        rien, et c'est la portee du champ.
+        """
+        blocking = [c for c in frame.clusters if c.in_corridor]
+        if blocking:
+            nearest = min(blocking, key=lambda c: c.range_m)
+            frame.forward_m = nearest.range_m
+            frame.forward_is_obstacle = True
+            return
+
+        if frame.contact is not None:
+            frame.forward_m = frame.contact.range_m
+            frame.forward_is_obstacle = True
+            return
+
+        far = frame.coverage[1]
+        if math.isfinite(far) and far > 0.0:
+            frame.forward_m = float(far)
+            frame.forward_is_obstacle = False
+
+    def _raise_alert(self, frame: MapFrame, result: DetectionResult) -> None:
+        """Niveau de proximite, sur deux criteres qui ne disent pas la meme chose.
+
+        La distance dit ou est l'obstacle; le temps avant contact dit s'il
+        s'approche. Un mur a un metre devant un drone a l'arret n'est pas une
+        urgence, et un mur a quatre metres aborde a trois metres par seconde en
+        est une. Retenir le plus severe des deux est la seule lecture qui ne
+        laisse passer ni l'un ni l'autre.
+        """
+        level, reason = 0, ""
+        d = frame.forward_m
+        if frame.forward_is_obstacle and math.isfinite(d):
+            if d < config.ALERT_DANGER_M:
+                level, reason = 2, f"obstacle a {d:.2f} m"
+            elif d < config.ALERT_WARN_M:
+                level, reason = 1, f"obstacle a {d:.2f} m"
+
+        ttc = result.global_ttc
+        if ttc is not None and ttc > 0:
+            if ttc < config.ALERT_DANGER_TTC_S and level < 2:
+                level, reason = 2, f"contact dans {ttc:.1f} s"
+            elif ttc < config.ALERT_WARN_TTC_S and level < 1:
+                level, reason = 1, f"contact dans {ttc:.1f} s"
+
+        frame.alert_level = level
+        frame.alert_reason = reason
+
+    @staticmethod
+    def _bbox_of(uv: Optional[np.ndarray], sel: np.ndarray) -> Tuple[int, int, int, int]:
+        if uv is None or len(sel) == 0:
+            return (0, 0, 0, 0)
+        pts = uv[sel]
+        return (int(pts[:, 0].min()), int(pts[:, 1].min()),
+                int(pts[:, 0].max()), int(pts[:, 1].max()))
 
     def _plausible(self, body: np.ndarray, sigma: np.ndarray) -> np.ndarray:
         """Ne garde que des points geometriquement defendables.

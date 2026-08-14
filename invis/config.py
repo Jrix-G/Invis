@@ -224,6 +224,31 @@ OBSTACLE_MIN_HEIGHT_M = 0.15
 # pas sa propre barre d'erreur n'a pas prouve qu'il n'etait pas au sol.
 OBSTACLE_HEIGHT_SIGMA_K = 1.0
 
+# ---------------------------------------------------------------------------
+# Separation des obstacles en objets distincts
+# ---------------------------------------------------------------------------
+
+# Taille de case de la carte d'occupation en vue de dessus, en metres.
+CLUSTER_RES_M = 0.25
+# Pontage entre cases, en nombre de cases. Deux mesures d'un meme objet fin
+# peuvent tomber dans des cases non adjacentes: sans pontage, un poteau se
+# compterait comme trois obstacles.
+CLUSTER_BRIDGE_CELLS = 1
+# Nombre de points sous lequel un amas n'est pas un objet mais du bruit.
+CLUSTER_MIN_POINTS = 5
+# Nombre d'objets rapportes, les plus proches d'abord. Au-dela, l'affichage
+# devient illisible et l'information cesse d'etre actionnable.
+CLUSTER_MAX = 6
+
+# Alerte de proximite. Deux criteres qui ne disent pas la meme chose: la
+# distance dit ou est l'obstacle, le temps avant contact dit s'il approche. Un
+# mur a un metre devant un drone a l'arret n'est pas une urgence; un mur a
+# quatre metres aborde a trois metres par seconde en est une.
+ALERT_WARN_M = 2.5
+ALERT_DANGER_M = 1.2
+ALERT_WARN_TTC_S = 2.5
+ALERT_DANGER_TTC_S = 1.2
+
 # Lecture de l'obstacle le plus proche.
 # Duree pendant laquelle un point triangule reste pris en compte.
 OBSTACLE_MEMORY_S = 2.0
@@ -316,6 +341,10 @@ GROUND_NORMAL_MIN_SCORE = 0.5
 
 # Vue de dessus du panneau de mesures: portee affichee, en metres.
 RADAR_SPAN_M = 5.0
+# Carte du vol: cote minimal affiche, en metres. Au debut du vol le terrain
+# connu tient dans un mouchoir; sans plancher, la carte serait un zoom absurde
+# sur quelques cases.
+MAP_MIN_SPAN_M = 8.0
 # Distances marquees sur l'image camera, en metres.
 RANGE_TICKS_M = (1.0, 2.0, 3.0, 4.0, 6.0)
 

@@ -28,6 +28,7 @@ COLOR_ALERT = (70, 70, 245)
 COLOR_RADAR = (70, 78, 90)
 COLOR_POINT = (70, 90, 245)
 COLOR_BAND = (95, 105, 120)
+COLOR_TRACK = (120, 220, 120)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -56,7 +57,7 @@ def compose(camera_view: Optional[np.ndarray], measures: np.ndarray,
         (camera_view, 0, 0, "1. camera + champ de vecteurs"),
         (measures, 0, 1, "2. mesures en direct"),
         (view3d, 1, 0, "3. reconstruction 3D"),
-        (spare, 1, 1, "4. libre"),
+        (spare, 1, 1, "4. carte du vol"),
     ]
     for tile, row, col, title in tiles:
         y0 = row * (ch + 2) + 1
@@ -144,11 +145,17 @@ def _draw_readouts(panel: np.ndarray, result, mapframe, link_fps: float,
     contact = getattr(mapframe, "contact", None) if mapframe else None
     nearest = getattr(mapframe, "nearest", None) if mapframe else None
 
+    # La distance droit devant vient en premier: c'est la seule qui reponde a
+    # la question du pilote sans qu'il ait a interpreter. Les deux suivantes
+    # disent d'ou elle vient.
+    y = _forward_block(panel, y, mapframe)
     y = _distance_block(panel, y, "contact sol", contact, COLOR_WARN)
     y = _distance_block(panel, y, "triangulation", nearest, COLOR_ALERT)
 
     ttc = result.global_ttc if result is not None else None
+    clusters = getattr(mapframe, "clusters", []) if mapframe else []
     rows = [
+        ("objets distincts", str(len(clusters)) if mapframe else "--"),
         ("temps avant contact", f"{ttc:.2f} s" if ttc else "--"),
         ("vitesse estimee", f"{mapframe.speed_mps:.2f} m/s" if mapframe else "--"),
         ("hauteur retenue", f"{mapframe.height_m:.2f} +/- {sigma_h:.2f} m" if mapframe else "--"),
@@ -171,6 +178,32 @@ def _draw_readouts(panel: np.ndarray, result, mapframe, link_fps: float,
         cv2.putText(panel, value, (w - 8 - _text_width(value, 0.36), y), FONT, 0.36,
                     COLOR_TEXT, 1, cv2.LINE_AA)
         y += 14
+
+
+def _forward_block(panel: np.ndarray, y: int, mapframe) -> int:
+    """Distance droit devant, et couleur du niveau d'alerte.
+
+    Une valeur toujours presente, jamais "--": faute d'obstacle, c'est le sol
+    qui est vise, et sa distance est connue exactement. Un tiret laisserait
+    croire que la mesure a echoue alors que la voie est simplement libre.
+    """
+    w = panel.shape[1]
+    forward = getattr(mapframe, "forward_m", float("nan")) if mapframe else float("nan")
+    level = getattr(mapframe, "alert_level", 0) if mapframe else 0
+    colour = COLOR_ALERT if level >= 2 else (COLOR_WARN if level == 1 else COLOR_GOOD)
+
+    cv2.putText(panel, "droit devant", (8, y), FONT, 0.34, COLOR_DIM, 1, cv2.LINE_AA)
+    value = f"{forward:.2f} m" if math.isfinite(forward) else "--"
+    cv2.putText(panel, value, (w - 8 - _text_width(value, 0.62), y), FONT, 0.62,
+                colour, 2, cv2.LINE_AA)
+    y += 14
+    if mapframe is not None:
+        kind = ("obstacle" if getattr(mapframe, "forward_is_obstacle", False)
+                else "voie libre, portee du champ")
+        note = mapframe.alert_reason or kind
+        cv2.putText(panel, note[:30], (w - 8 - _text_width(note[:30], 0.32), y), FONT,
+                    0.32, colour if level else COLOR_DIM, 1, cv2.LINE_AA)
+    return y + 16
 
 
 def _distance_block(panel: np.ndarray, y: int, label: str, measure,
@@ -227,22 +260,176 @@ def _draw_radar(panel: np.ndarray, mapframe) -> None:
         for x, y in zip(px[inside].astype(int), py[inside].astype(int)):
             cv2.circle(panel, (x, y), radius, colour, -1, cv2.LINE_AA)
 
+    # Couloir de vol: sans lui, "l'obstacle est a gauche" ne dit pas s'il
+    # genera. Le tracer transforme une position en decision.
+    corridor = int(config.OBSTACLE_CORRIDOR_M * scale)
+    cv2.line(panel, (origin[0] - corridor, origin[1]), (origin[0] - corridor, 20),
+             COLOR_RADAR, 1, cv2.LINE_AA)
+    cv2.line(panel, (origin[0] + corridor, origin[1]), (origin[0] + corridor, 20),
+             COLOR_RADAR, 1, cv2.LINE_AA)
+
     plot(mapframe.ground_body, (90, 82, 62), 1)
     plot(mapframe.obstacle_body, COLOR_POINT, 2)
 
-    measure = mapframe.nearest or mapframe.contact
-    if measure is not None:
-        y = origin[1] - int(measure.range_m * scale)
-        if 20 <= y < h:
-            cv2.line(panel, (8, y), (w - 8, y), COLOR_ALERT, 1, cv2.LINE_AA)
-            cv2.putText(panel, f"{measure.range_m:.2f} m", (10, max(28, y - 4)), FONT,
-                        0.34, COLOR_ALERT, 1, cv2.LINE_AA)
+    # Un rectangle par objet distinct, plutot qu'une ligne unique en travers
+    # de tout le radar: deux objets separes se lisent comme deux objets.
+    for rank, cluster in enumerate(getattr(mapframe, "clusters", [])):
+        cx = origin[0] - int(cluster.lateral_m * scale)
+        cy = origin[1] - int(cluster.forward_m * scale)
+        if not (0 <= cx < w and 20 <= cy < h):
+            continue
+        half = max(2, int(cluster.width_m * scale / 2))
+        colour = COLOR_ALERT if cluster.in_corridor else COLOR_BAND
+        cv2.rectangle(panel, (cx - half, cy - 3), (cx + half, cy + 3), colour, 1)
+        if rank < 2:
+            cv2.putText(panel, f"{cluster.range_m:.1f}", (cx + half + 3, cy + 3),
+                        FONT, 0.30, colour, 1, cv2.LINE_AA)
 
     cv2.circle(panel, origin, 3, COLOR_TEXT, -1, cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
-# Panneau 4: reserve
+# Panneau 4: carte du vol
+# ---------------------------------------------------------------------------
+
+def draw_map(size: Tuple[int, int], mapper, mapframe) -> np.ndarray:
+    """Carte de dessus du terrain parcouru, en coordonnees monde.
+
+    La vue de dessus du panneau 2 est centree sur le drone et ne montre que
+    l'instant: elle repond a "qu'y a-t-il devant moi maintenant". Elle ne dit
+    rien de ce qui a ete explore, ni de la forme du trajet, ni si l'on
+    s'apprete a repasser au meme endroit.
+
+    Cette carte-ci est fixe dans le monde. C'est la seule vue ou une derive
+    d'odometrie se *voit*: un aller-retour qui ne se referme pas y saute aux
+    yeux, alors qu'aucun chiffre ne l'aurait signale.
+
+    Le fond est la carte d'elevation elle-meme, lue directement comme une
+    image -- elle est deja une grille reguliere, il n'y a donc rien a
+    reprojeter, seulement a recadrer.
+    """
+    w, h = size
+    img = np.full((h, w, 3), COLOR_PANEL, dtype=np.uint8)
+    grid = getattr(mapper, "grid", None)
+    cv2.putText(img, "carte du vol (repere monde)", (8, 14), FONT, 0.34,
+                COLOR_DIM, 1, cv2.LINE_AA)
+    if grid is None or len(grid) == 0:
+        return draw_spare(size, ["carte du vol",
+                                 "le terrain apparait a mesure du survol"])
+
+    view = _map_extent(mapper, mapframe, w, h)
+    if view is None:
+        return img
+    x0, y0, span = view
+    scale = min(w, h - 20) / span
+
+    def to_px(xy: np.ndarray) -> np.ndarray:
+        px = (xy[:, 0] - x0) * scale
+        # L'axe Y du monde monte vers la gauche; a l'ecran il descend. Le
+        # renversement se fait ici, une seule fois.
+        py = (h - 6) - (xy[:, 1] - y0) * scale
+        return np.column_stack([px, py])
+
+    _blit_terrain(img, grid, x0, y0, span, scale, w, h)
+    _draw_track(img, mapper, to_px, w, h)
+    _draw_map_obstacles(img, mapper, mapframe, to_px, w, h)
+    _draw_map_drone(img, mapframe, to_px, w, h)
+
+    cv2.putText(img, f"{span:.0f} m de cote  |  {len(grid)} cases",
+                (8, h - 6), FONT, 0.32, COLOR_DIM, 1, cv2.LINE_AA)
+    return img
+
+
+def _map_extent(mapper, mapframe, w: int, h: int):
+    """Cadre a afficher: tout le terrain connu, avec une marge."""
+    grid = mapper.grid
+    filled = np.flatnonzero(grid.count > 0)
+    if len(filled) == 0:
+        return None
+    cx = filled % grid.cells
+    cy = filled // grid.cells
+    lo = np.array([grid.origin[0] + cx.min() * grid.res,
+                   grid.origin[1] + cy.min() * grid.res])
+    hi = np.array([grid.origin[0] + (cx.max() + 1) * grid.res,
+                   grid.origin[1] + (cy.max() + 1) * grid.res])
+    centre = (lo + hi) / 2.0
+    span = float(max(hi[0] - lo[0], hi[1] - lo[1])) * 1.15
+    span = max(span, config.MAP_MIN_SPAN_M)
+    return centre[0] - span / 2.0, centre[1] - span / 2.0, span
+
+
+def _blit_terrain(img, grid, x0, y0, span, scale, w, h) -> None:
+    """Recadre la carte d'elevation dans le panneau, sans reprojection."""
+    n = grid.cells
+    i0 = int(np.floor((x0 - grid.origin[0]) / grid.res))
+    j0 = int(np.floor((y0 - grid.origin[1]) / grid.res))
+    side = int(np.ceil(span / grid.res))
+    i1, j1 = min(n, i0 + side), min(n, j0 + side)
+    i0, j0 = max(0, i0), max(0, j0)
+    if i1 <= i0 or j1 <= j0:
+        return
+
+    colour = grid.colour.reshape(n, n, 3)[j0:j1, i0:i1]
+    lit = grid.shading().reshape(n, n)[j0:j1, i0:i1]
+    seen = grid.count.reshape(n, n)[j0:j1, i0:i1] > 0
+
+    tile = np.clip(colour * lit[:, :, None], 0, 255).astype(np.uint8)
+    tile[~seen] = COLOR_PANEL
+    # L'axe Y monte vers le haut dans le monde, vers le bas a l'ecran.
+    tile = np.flipud(tile)
+
+    out_w = max(1, int((i1 - i0) * grid.res * scale))
+    out_h = max(1, int((j1 - j0) * grid.res * scale))
+    tile = cv2.resize(tile, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+
+    px = int((grid.origin[0] + i0 * grid.res - x0) * scale)
+    py = (h - 6) - int((grid.origin[1] + j1 * grid.res - y0) * scale)
+    sx0, sy0 = max(0, px), max(0, py)
+    sx1, sy1 = min(w, px + out_w), min(h, py + out_h)
+    if sx1 <= sx0 or sy1 <= sy0:
+        return
+    img[sy0:sy1, sx0:sx1] = tile[sy0 - py:sy1 - py, sx0 - px:sx1 - px]
+
+
+def _draw_track(img, mapper, to_px, w, h) -> None:
+    if len(mapper.trajectory) < 2:
+        return
+    pts = to_px(np.asarray(mapper.trajectory, dtype=np.float64)[:, :2])
+    poly = pts.astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(img, [poly], False, COLOR_TRACK, 1, cv2.LINE_AA)
+
+
+def _draw_map_obstacles(img, mapper, mapframe, to_px, w, h) -> None:
+    """Reliefs releves, en coordonnees monde, les recents mis en avant."""
+    xyz, kind, stamp, _sigma, _bgr = mapper.cloud.view_full()
+    sel = kind == 1
+    if not sel.any():
+        return
+    pts = to_px(xyz[sel][:, :2].astype(np.float64))
+    inside = ((pts[:, 0] >= 0) & (pts[:, 0] < w)
+              & (pts[:, 1] >= 20) & (pts[:, 1] < h))
+    if not inside.any():
+        return
+    px = pts[inside].astype(np.int32)
+    img[px[:, 1], px[:, 0]] = COLOR_POINT
+
+
+def _draw_map_drone(img, mapframe, to_px, w, h) -> None:
+    if mapframe is None:
+        return
+    pos = np.asarray(mapframe.position, dtype=np.float64)[None, :2]
+    p = to_px(pos)[0]
+    if not (0 <= p[0] < w and 0 <= p[1] < h):
+        return
+    yaw = math.radians(mapframe.yaw_deg)
+    nose = to_px(pos + np.array([[math.cos(yaw), math.sin(yaw)]]) * 0.8)[0]
+    cv2.line(img, (int(p[0]), int(p[1])), (int(nose[0]), int(nose[1])),
+             COLOR_TEXT, 1, cv2.LINE_AA)
+    cv2.circle(img, (int(p[0]), int(p[1])), 3, COLOR_TEXT, -1, cv2.LINE_AA)
+
+
+# ---------------------------------------------------------------------------
+# Panneau de secours
 # ---------------------------------------------------------------------------
 
 def draw_spare(size: Tuple[int, int], lines=None) -> np.ndarray:

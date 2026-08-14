@@ -685,6 +685,64 @@ def test_attitude_robustness() -> None:
            f"ecart max {drift:.2f} deg (mesure a 4.5 deg avant durcissement)")
 
 
+def test_clusters_and_alert() -> None:
+    """Deux obstacles separes doivent se compter comme deux, avec leur distance.
+
+    La grille 3x3 disait dans quelle case de l'image il y avait du relief. Ce
+    n'est ni un objet ni une distance: deux poteaux de part et d'autre du
+    couloir donnaient la meme lecture qu'un mur en travers.
+    """
+    print("\n-- objets distincts et alerte -------------------------------")
+    from invis.mapper import Mapper
+    from invis.simulator import FlightSimulator, Wall
+
+    # Les deux poteaux sont places dans la portee reelle du montage: a 45
+    # degres de piquage la camera ne voit le sol que jusqu'a environ 2,2 fois
+    # la hauteur de vol, soit 4,4 m ici. Plus loin, il n'y a rien a detecter.
+    sim = FlightSimulator(height_m=2.0, speed_mps=0.8, walls=[
+        Wall(x_m=4.0, y_m=-1.2, width_m=0.6, height_m=1.3),
+        Wall(x_m=4.0, y_m=+1.2, width_m=0.6, height_m=1.3),
+    ])
+    det = ObstacleDetector()
+    mapper = Mapper(height_m=2.0)
+    seen_two = 0
+    frames = 0
+    forward_always = True
+    for k in range(int((3.4 / 0.8) * FPS_SIM)):
+        t = k / FPS_SIM
+        img = sim.render(t)
+        frame = mapper.update(det.process(img, t), img)
+        if frame.clusters:
+            frames += 1
+            if len(frame.clusters) >= 2:
+                seen_two += 1
+        if frame.ok and not math.isfinite(frame.forward_m):
+            forward_always = False
+
+    _check(frames > 0, "des objets sont detectes", f"{frames} images avec objets")
+    _check(seen_two >= max(1, frames // 4), "les deux poteaux comptent pour deux",
+           f"{seen_two}/{frames} images voient au moins deux objets")
+    _check(forward_always, "la distance droit devant est toujours renseignee",
+           "sol a defaut d'obstacle")
+
+    # Un mur en travers doit, lui, declencher l'alerte de couloir.
+    sim = FlightSimulator(height_m=2.0, speed_mps=0.8,
+                          walls=[Wall(x_m=4.0, width_m=2.4, height_m=1.4)])
+    det = ObstacleDetector()
+    mapper = Mapper(height_m=2.0)
+    levels, corridor = [], 0
+    for k in range(int((3.4 / 0.8) * FPS_SIM)):
+        t = k / FPS_SIM
+        frame = mapper.update(det.process(sim.render(t), t))
+        levels.append(frame.alert_level)
+        corridor += any(c.in_corridor for c in frame.clusters)
+    _check(corridor > 0, "mur en travers reconnu comme coupant le couloir",
+           f"{corridor} images")
+    _check(max(levels) >= 2, "alerte de danger levee a l'approche",
+           f"niveau max {max(levels)}")
+    _check(levels[0] == 0, "aucune alerte au depart, loin du mur")
+
+
 def test_elevation_grid() -> None:
     """La carte d'elevation doit moyenner, se recentrer et rester bornee."""
     print("\n-- carte d'elevation ----------------------------------------")
@@ -1250,6 +1308,7 @@ def main() -> int:
     test_imu_fusion()
     test_loop_closure()
     test_elevation_grid()
+    test_clusters_and_alert()
     test_attitude_robustness()
     test_metric_reconstruction()
     test_scale_invariance()

@@ -9,7 +9,7 @@ Disposition:
     1. haut gauche  -- image camera, champ de vecteurs, reperes de distance
     2. haut droite  -- mesures en direct et vue de dessus
     3. bas gauche   -- reconstruction 3D qui se construit au fil du vol
-    4. bas droite   -- libre
+    4. bas droite   -- carte du vol, vue de dessus fixe dans le monde
 
 Le programme est en lecture seule vis-a-vis du vol. Les seuls appels pouvant
 modifier quelque chose sur la carte visent /control, qui ne touche que la
@@ -483,8 +483,8 @@ class VisionApp(tk.Tk):
                                         sigma_h=self.mapper.sigma_h_m,
                                         gate=self.gate)
         view3d = self.renderer.render(self.mapper, mapframe, dt_render)
-        spare = panels.draw_spare((cw, ch - 16))
-        return panels.compose(view, measures, view3d, spare, (cw, ch))
+        flight_map = panels.draw_map((cw, ch - 16), self.mapper, mapframe)
+        return panels.compose(view, measures, view3d, flight_map, (cw, ch))
 
     def _warn_quality(self, quality) -> None:
         """Signale une degradation du flux, sans inonder la console.
