@@ -13,6 +13,7 @@ rotation, cause classique de fausse alarme en flux optique.
 from __future__ import annotations
 
 import http.server
+import json
 import math
 import os
 import socketserver
@@ -208,6 +209,208 @@ def test_link() -> None:
         img = cv2.imdecode(np.frombuffer(got, np.uint8), cv2.IMREAD_COLOR)
         _check(img is not None and img.shape[:2] == (H, W), "image decodable a la bonne taille",
                str(None if img is None else img.shape))
+
+
+class _CountingServer(socketserver.ThreadingTCPServer):
+    """Serveur qui compte les sockets acceptees et les acces simultanes.
+
+    C'est la seule mesure qui compte pour ce test: pas le nombre de requetes
+    HTTP, mais le nombre de connexions TCP reellement ouvertes.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.opened = 0
+        self.live = 0
+        self.peak = 0
+        self._count_lock = threading.Lock()
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        with self._count_lock:
+            self.opened += 1
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+        return sock, addr
+
+    def shutdown_request(self, request) -> None:
+        with self._count_lock:
+            self.live -= 1
+        super().shutdown_request(request)
+
+    def handle_error(self, request, client_address) -> None:
+        # Fermer une socket persistante fait crier le serveur de test. C'est
+        # le comportement attendu ici, pas une erreur a afficher.
+        pass
+
+
+class _BoardHandler(http.server.BaseHTTPRequestHandler):
+    """Carte simulee: /status annonce l'etat camera, /stream sert le flux."""
+
+    protocol_version = "HTTP/1.1"      # sans quoi keep-alive est impossible
+    payload = b""
+    camera_enabled = True
+    stream_requests = 0
+
+    def log_message(self, *_args) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        if self.path.startswith("/status"):
+            body = json.dumps({"camera_enabled": type(self).camera_enabled}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        type(self).stream_requests += 1
+        if not type(self).camera_enabled:
+            body = b"camera off"
+            self.send_response(503)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace;boundary=frame")
+        self.end_headers()
+        try:
+            while True:
+                self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                 + str(len(self.payload)).encode() + b"\r\n\r\n"
+                                 + self.payload + b"\r\n")
+                self.wfile.flush()
+                time.sleep(0.02)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+
+def test_socket_budget() -> None:
+    """Invis ne doit jamais deborder du budget de sockets de la carte.
+
+    Ce test ne parle pas de video: il parle de securite de vol. La carte sert
+    le flux et le lien de pilotage sur le meme serveur HTTP, avec un pool de
+    sept sockets purge en LRU. Le WebSocket /pilot est persistant mais
+    silencieux entre deux commandes: c'est donc lui que la carte sacrifie
+    quand le pool sature. La page de pilotage retombe alors sur le repli HTTP,
+    l'ecart entre deux commandes depasse la seconde, et le firmware latche
+    LAND. Autrement dit, une station sol trop bavarde rend le drone
+    impilotable -- ce qui s'est produit.
+
+    Deux comportements sont donc verifies, et un troisieme par omission:
+    les sockets sont reutilisees, jamais plus de MAX_ESP_SOCKETS a la fois,
+    et une camera annoncee eteinte fait cesser les demandes de flux.
+    """
+    print("\n-- budget de sockets vers la carte --------------------------")
+    from invis import config
+    from invis.mjpeg_client import http_get
+
+    ok, buf = cv2.imencode(".jpg", synth_frame(0), [cv2.IMWRITE_JPEG_QUALITY, 52])
+    _BoardHandler.payload = buf.tobytes()
+    _BoardHandler.camera_enabled = True
+    _BoardHandler.stream_requests = 0
+
+    with _CountingServer(("127.0.0.1", 0), _BoardHandler) as httpd:
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+        # 1. Flux video et interrogations de /status en parallele, depuis
+        #    plusieurs fils: le cas ou une implementation naive explose.
+        link = VideoLink(host="127.0.0.1", port=port, mode="stream")
+        link.start()
+        stop = threading.Event()
+
+        def hammer() -> None:
+            while not stop.is_set():
+                try:
+                    http_get("127.0.0.1", config.STATUS_PATH, port=port)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        workers = [threading.Thread(target=hammer, daemon=True) for _ in range(4)]
+        for w in workers:
+            w.start()
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            link.take_latest()
+            time.sleep(0.01)
+        stop.set()
+        for w in workers:
+            w.join(timeout=2.0)
+        frames = link.stats.frames
+        busy_peak = httpd.peak
+        busy_opened = httpd.opened
+        link.stop()
+
+        _check(busy_peak <= config.MAX_ESP_SOCKETS,
+               f"jamais plus de {config.MAX_ESP_SOCKETS} sockets simultanees",
+               f"maximum observe {busy_peak}")
+        # Sans connexions persistantes, quelques secondes de ce regime ouvrent
+        # des milliers de sockets: c'est exactement ce qui purgeait /pilot.
+        _check(busy_opened <= 4 * config.MAX_ESP_SOCKETS,
+               "sockets reutilisees et non rouvertes a chaque appel",
+               f"{busy_opened} ouvertes pour {frames} images et un martelage de /status")
+        _check(frames > 0, "le flux passe malgre le plafond de sockets",
+               f"{frames} images")
+
+        # 2. Camera annoncee eteinte: plus aucune demande de flux.
+        _BoardHandler.camera_enabled = False
+        _BoardHandler.stream_requests = 0
+        link = VideoLink(host="127.0.0.1", port=port, mode="stream")
+        link.start()
+        time.sleep(max(3.0, config.CAMERA_OFF_POLL_S + 1.0))
+        asked = _BoardHandler.stream_requests
+        link.stop()
+        httpd.shutdown()
+
+    _check(asked == 0, "camera eteinte -> plus aucune demande de /stream",
+           f"{asked} demandes")
+    _check(min(config.RECONNECT_BACKOFF_S) >= 1.0,
+           "plancher de reprise d'au moins 1 s",
+           f"{config.RECONNECT_BACKOFF_S}")
+    _check(config.STATUS_POLL_S >= 2.0, "pas de sondage /status plus rapide que 2 s",
+           f"{config.STATUS_POLL_S}s")
+
+    # 3. Contrepartie des connexions persistantes: la carte peut fermer une
+    #    socket inactive sans l'annoncer -- c'est meme precisement ce que fait
+    #    sa purge LRU. On ne l'apprend qu'en ecrivant dedans. Sans reprise,
+    #    reutiliser une socket serait donc *moins* fiable que d'en rouvrir
+    #    une, et le remede serait pire que le mal.
+    class _SilentCloser(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            self.request.recv(4096)
+            self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            time.sleep(0.05)
+            self.request.close()      # keep-alive annonce, socket fermee quand meme
+
+    class _Threaded(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+        def handle_error(self, request, client_address) -> None:
+            pass
+
+    with _Threaded(("127.0.0.1", 0), _SilentCloser) as httpd:
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        replies = []
+        for _ in range(4):
+            try:
+                replies.append(http_get("127.0.0.1", config.STATUS_PATH, port=port))
+            except Exception as exc:  # noqa: BLE001
+                replies.append(f"echec: {exc}")
+            time.sleep(0.2)
+        httpd.shutdown()
+
+    _check(all(r == "ok" for r in replies),
+           "socket fermee en douce par la carte -> appel suivant rejoue",
+           str(replies))
 
 
 def test_session_roundtrip() -> None:
@@ -1369,6 +1572,7 @@ def main() -> int:
     test_rendering()
     test_link()
     test_truncated_frames()
+    test_socket_budget()
     test_updater()
     test_bootstrap()
     test_session_roundtrip()

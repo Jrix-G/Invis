@@ -120,6 +120,7 @@ class VisionApp(tk.Tk):
         self._last_state: Optional[str] = None
         self._last_obstacle_log = 0.0
         self._quality_warned = 0.0
+        self._status_asked = 0.0
         self._last_result = None
         self._last_mapframe = None
         self._update_dismissed = False
@@ -428,7 +429,15 @@ class VisionApp(tk.Tk):
     # -- commandes camera --------------------------------------------------
 
     def _query_status(self) -> None:
-        host = self.var_host.get().strip()
+        # Un clic repete ne doit pas devenir un sondage rapide: chaque appel
+        # prend une socket sur la carte, et la carte y fait passer le lien
+        # pilote. STATUS_POLL_S est le pas minimal, ici comme dans VideoLink.
+        now = time.time()
+        if now - self._status_asked < config.STATUS_POLL_S:
+            self.log(f"/status ignore (pas mini {config.STATUS_POLL_S:.0f}s)")
+            return
+        self._status_asked = now
+        host = self.var_host.get().strip() or config.DEFAULT_HOST
 
         def work() -> None:
             try:

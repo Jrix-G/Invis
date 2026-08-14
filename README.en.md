@@ -205,6 +205,36 @@ between the obstacle and the ground is ~3 px at 320x240 and ~1.5 px at 160x120
 — below the plane-fitting threshold. Downsampling removed the very signal being
 looked for.
 
+## Not disturbing the pilot link
+
+The board is not just a camera. The same HTTP server also carries the drone's
+control link (`/pilot`, a WebSocket), on a pool of 7 sockets with LRU purging.
+The pilot WebSocket is persistent but silent between commands, which makes it
+the natural purge candidate whenever the pool fills up. Losing it drops the
+control page onto the slower HTTP fallback, the gap between two commands
+exceeds the firmware's 1000 ms failsafe, and **the drone latches LAND**.
+
+Invis has caused exactly that: `Connection: close` on every request meant a
+fresh TCP socket per call, and a 50 ms reconnect floor turned an unavailable
+stream into ~20 new sockets per second. Three rules now hold, and are covered
+by a test (`test_socket_budget`):
+
+- **connections are persistent and shared.** One pooled session per board,
+  reused across `/stream`, `/jpg`, `/status` and `/control`. Built on
+  `http.client`, deliberately: the signed update ships 200 KB of `.py` and
+  nothing else, so a third-party import here would fail to start on every
+  already-distributed executable;
+- **at most `MAX_ESP_SOCKETS = 2` sockets are open at once**, all functions
+  included, enforced by a semaphore and a blocking pool;
+- **no hammering.** Reconnect floor at 1 s (`RECONNECT_BACKOFF_S`), `/status`
+  polled no faster than 2 s (`STATUS_POLL_S`), and when `/status` reports
+  `"camera_enabled": false` the stream is not requested at all — Invis just
+  watches slowly for the camera to come back.
+
+Invis remains read-only: it never calls `/pilot` and never sends a command.
+When video smoothness and flight safety conflict, dropped frames are
+acceptable; a dropped pilot link is not.
+
 ## Files
 
 | File | Role |

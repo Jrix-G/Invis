@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Tuple
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 APP_NAME = "esp32cam-vision"
 
 

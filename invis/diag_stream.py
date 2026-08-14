@@ -119,21 +119,27 @@ def raw_socket_read(host: str, port: int, seconds: float, load_ms: float = 0.0,
 
 
 def urllib_read(host: str, port: int, seconds: float) -> Run:
-    """Le chemin utilise par le programme, pour comparaison."""
-    import urllib.request
+    """Le chemin utilise par le programme, pour comparaison.
 
-    run = Run(label="urllib (comme gcs_vision)")
+    Passe par la session partagee, comme gcs_vision: la socket est reutilisee
+    d'un essai a l'autre. Un diagnostic qui ouvrirait une socket par tentative
+    mesurerait un autre programme que celui qu'on veut diagnostiquer -- et
+    prendrait au passage la place du lien pilote dans le pool de la carte.
+    """
+    from .mjpeg_client import board_session
+
+    http = board_session(host, port)
+    run = Run(label="session partagee (comme gcs_vision)")
     end = time.time() + seconds
     while time.time() < end:
         started = time.time()
         try:
-            req = urllib.request.Request(f"http://{host}:{port}{config.STREAM_PATH}",
-                                         headers={"Connection": "close"})
-            with urllib.request.urlopen(req, timeout=6.0) as resp:
+            with http.open(config.STREAM_PATH, timeout=(4.0, 6.0), stream=True) as resp:
+                resp.raise_for_status()
                 buffer = bytearray()
                 last_read = time.time()
                 while time.time() < end:
-                    chunk = resp.read(4096)
+                    chunk = resp.raw.read(4096)
                     now = time.time()
                     run.stalls.append(now - last_read)
                     last_read = now

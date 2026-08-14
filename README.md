@@ -28,7 +28,7 @@ pip install -r requirements.txt
 python -m invis.gcs_vision
 
 # Tools
-python -m invis.test_invis        # 80 tests, no hardware
+python -m invis.test_invis        # 126 checks, no hardware
 python -m invis.bench --host 192.168.4.50   # link frame rate
 python -m invis.replay <session> --height 2.4   # re-fly a recording
 ```
@@ -38,6 +38,8 @@ python -m invis.replay <session> --height 2.4   # re-fly a recording
 **What it does**
 
 `camera` knows the ground → **metric distances** · `contact point` + `triangulation` → positions · attitude, odometry & a **live 3D point cloud** come along. Read-only: no `/pilot`, never sends a command.
+
+And it stays out of the way: **at most 2 persistent sockets** to the board, ever. The pilot WebSocket shares that HTTP server on an LRU-purged pool — a chatty ground station gets it purged and the drone latches LAND.
 
 </div>
 

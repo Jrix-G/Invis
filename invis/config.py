@@ -24,14 +24,54 @@ CONTROL_PATH = "/control"
 # connecter ici coupe donc l'onglet navigateur eventuellement ouvert.
 CONNECT_TIMEOUT_S = 4.0
 READ_TIMEOUT_S = 6.0
-# Attente avant reprise du flux. La carte coupe la connexion toutes les
-# quelques secondes (IncompleteRead cote client): une coupure est donc un
-# evenement courant, pas une panne. La premiere reprise doit etre quasi
-# immediate, sinon le temps mort depasse le temps de flux utile.
-RECONNECT_BACKOFF_S = (0.05, 0.2, 0.6, 1.5, 3.0)
+
+# Nombre maximal de sockets simultanees ouvertes vers la carte, toutes
+# fonctions confondues (flux video + /status + /control).
+#
+# Ce plafond n'est pas un reglage de confort, c'est une contrainte de securite
+# de vol. Le serveur HTTP du firmware tourne avec max_open_sockets = 7 et
+# lru_purge_enable = true: quand le pool est plein, il ferme la socket la moins
+# recemment utilisee. Le WebSocket /pilot du navigateur est persistant mais
+# silencieux entre deux commandes, donc c'est *lui* le candidat naturel a la
+# purge. Le perdre fait retomber la page sur le repli HTTP, plus lent, l'ecart
+# entre deux commandes depasse PILOT_FAILSAFE_TIMEOUT_MS = 1000 ms cote
+# firmware, et le drone latche LAND. Autrement dit: une station sol qui ouvre
+# des sockets sans compter rend le drone impilotable.
+#
+# Deux sockets suffisent ici: une pour le flux video, qui reste ouverte, une
+# pour les appels ponctuels. Au-dela, on empiete sur la marge du lien pilote.
+MAX_ESP_SOCKETS = 2
+# Attente maximale pour obtenir un des jetons ci-dessus. Depassee, l'appel
+# echoue au lieu de s'empiler: mieux vaut un /status manque qu'une file
+# d'attente qui finit par ouvrir des sockets en rafale.
+SOCKET_ACQUIRE_TIMEOUT_S = 10.0
+
+# Attente avant reprise du flux.
+#
+# La premiere reprise etait a 50 ms, cale sur l'idee qu'une coupure est un
+# evenement courant qu'il faut rattraper sans temps mort. C'est vrai quand le
+# flux existe -- et catastrophique quand il n'existe pas: /stream echoue alors
+# instantanement et la boucle ouvre jusqu'a ~20 sockets neuves par seconde,
+# ce qui vide le pool de la carte et fait purger le lien pilote (voir
+# MAX_ESP_SOCKETS). Un ESP32 n'est pas un serveur: un flux absent ne
+# reapparait pas en 50 ms, l'insistance ne fait que nuire.
+#
+# Le cout de ce plancher est borne: les sockets etant desormais reutilisees,
+# une coupure nette du flux est bien plus rare qu'avant, et perdre une seconde
+# d'images est acceptable la ou perdre le lien pilote ne l'est pas.
+RECONNECT_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 15.0)
 # Duree au-dela de laquelle un flux est juge "a fonctionne", ce qui remet le
 # decompte des tentatives a zero.
 RECONNECT_STABLE_S = 1.5
+
+# Intervalle minimal entre deux interrogations de /status. Rien ne justifie
+# d'aller plus vite: /status decrit un etat qui change a l'echelle de la
+# seconde, et chaque appel prend un jeton de socket.
+STATUS_POLL_S = 2.0
+# Intervalle de veille quand la carte annonce "camera_enabled": false. Dans ce
+# cas /stream ne peut pas exister; on cesse completement de le demander et on
+# se contente de guetter le retour de la camera, lentement.
+CAMERA_OFF_POLL_S = 5.0
 
 # Taille maximale d'une image JPEG acceptee. Au-dela on considere le tampon
 # desynchronise et on repart d'un marqueur SOI propre.
