@@ -13,6 +13,7 @@ rotation, cause classique de fausse alarme en flux optique.
 from __future__ import annotations
 
 import http.server
+import math
 import os
 import socketserver
 import sys
@@ -406,6 +407,464 @@ def test_metric_reconstruction() -> None:
         _check(drift < 0.35, f"odometrie ({tag})",
                f"{odo[-1][0]:.2f} m estime contre {odo[-1][1]:.2f} m, derive {drift:.0%}")
         _check(len(mapper.cloud) > 500, f"nuage alimente ({tag})", f"{len(mapper.cloud)} pts")
+
+
+def test_fusion() -> None:
+    """Le filtre doit lisser le bruit, rejeter l'aberrant, arreter la derive."""
+    print("\n-- filtrage de la pose --------------------------------------")
+    from invis.fusion import ConstantVelocity, HeadingFilter, wrap_angle
+
+    rng = np.random.default_rng(11)
+    dt, truth_v = 0.15, np.array([0.8, 0.0])
+
+    # 1) Bruit: la vitesse filtree doit etre plus proche du vrai que la mesure.
+    kf = ConstantVelocity(dim=2, accel_sigma=1.5, meas_sigma=0.30)
+    raw_err, filt_err = [], []
+    for _ in range(120):
+        z = truth_v + rng.normal(0.0, 0.30, size=2)
+        kf.predict(dt)
+        kf.update_velocity(z)
+        raw_err.append(np.linalg.norm(z - truth_v))
+        filt_err.append(np.linalg.norm(kf.velocity - truth_v))
+    gain = float(np.mean(raw_err) / max(1e-9, np.mean(filt_err)))
+    # Le gain est borne par le bruit de modele, et c'est voulu: avec une
+    # acceleration possible de 1,5 m/s^2 sur 0,15 s, le modele lui-meme laisse
+    # filer 0,22 m/s entre deux images, contre 0,30 m/s de bruit de mesure. Le
+    # filtre moyenne donc environ trois mesures, soit un facteur racine de
+    # trois. Exiger davantage reviendrait a pretendre que le drone
+    # n'accelere pas -- le filtre suivrait alors mal les vraies variations.
+    _check(gain > 1.5, "bruit de vitesse reduit par le filtre",
+           f"erreur divisee par {gain:.1f} (borne modele ~1.7)")
+
+    # 2) Aberrant: une mesure incompatible est ecartee, pas moyennee.
+    accepted = kf.update_velocity(np.array([12.0, -9.0]))
+    _check(not accepted, "mesure aberrante rejetee par le test de compatibilite")
+    _check(np.linalg.norm(kf.velocity - truth_v) < 0.2,
+           "l'etat survit intact au rejet", f"v={np.round(kf.velocity, 3)}")
+
+    # 3) Stationnaire: la vitesse nulle observee doit stopper l'etat.
+    for _ in range(12):
+        kf.predict(dt)
+        kf.update_velocity(np.zeros(2), sigma=0.10)
+    _check(kf.speed < 0.08, "vitesse nulle observee -> etat immobilise",
+           f"{kf.speed:.3f} m/s")
+
+    # 4) L'incertitude de position doit croitre: rien ne l'observe.
+    free = ConstantVelocity(dim=2)
+    before = free.position_sigma
+    for _ in range(80):
+        free.predict(dt)
+    _check(free.position_sigma > before + 0.5,
+           "incertitude de position croissante sans recalage",
+           f"{before:.3f} -> {free.position_sigma:.2f} m")
+
+    # 5) Cap: le repliement doit etre correct au passage de +/-180 degres.
+    heading = HeadingFilter()
+    heading.set_yaw(math.radians(179.0))
+    for _ in range(20):
+        heading.predict(dt)
+        heading.update_delta(math.radians(1.0), dt)
+    _check(abs(heading.yaw_rad) > math.radians(150.0),
+           "cap replie correctement au passage de 180 degres",
+           f"{math.degrees(heading.yaw_rad):+.1f} deg")
+    _check(abs(wrap_angle(math.radians(370.0)) - math.radians(10.0)) < 1e-9,
+           "repliement d'angle exact")
+
+
+def test_structure() -> None:
+    """Intersection de visees: exacte sans bruit, incertitude coherente."""
+    print("\n-- structure par visees multiples ---------------------------")
+    from invis import geometry
+    from invis.geometry import Intrinsics
+    from invis.structure import RayBundle
+
+    K = Intrinsics.from_fov(W, H)
+    tilt, height = -45.0, 2.5
+    R_bc = geometry.body_from_camera(tilt, 0.0)
+    truth = np.array([[6.0, 0.0, 1.4], [6.0, 0.5, 0.9], [5.0, -0.3, 0.6]])
+    ids = np.arange(len(truth))
+
+    def fly(bundle, steps, noise_px=0.0, rng=None):
+        out = None
+        for k in range(steps):
+            pos = np.array([0.09 * k, 0.0, height])
+            cam = (truth - pos) @ R_bc
+            uv = np.column_stack([cam[:, 0] / cam[:, 2] * K.fx + K.cx,
+                                  cam[:, 1] / cam[:, 2] * K.fy + K.cy])
+            if noise_px and rng is not None:
+                uv = uv + rng.normal(0.0, noise_px, size=uv.shape)
+            rays = geometry.rays_body(uv, K, R_bc)
+            rows = bundle.observe(ids, pos, rays)
+            out = bundle.solve(rows, min_views=3, max_sigma_m=1e9, focal_px=K.fx)
+        return out
+
+    X, sigma, _ = fly(RayBundle(capacity=32, sigma_px=0.6), 10)
+    err = np.linalg.norm(X - truth, axis=1)
+    _check(float(err.max()) < 1e-6, "visees exactes -> point exact",
+           f"erreur max {err.max():.2e} m")
+
+    # L'incertitude doit decroitre quand la base s'allonge, et le faire de
+    # facon monotone: c'est ce qui la rend utilisable comme critere.
+    short = fly(RayBundle(capacity=32, sigma_px=0.6), 4)[1]
+    long_ = fly(RayBundle(capacity=32, sigma_px=0.6), 14)[1]
+    _check(bool(np.all(long_ < short)), "incertitude decroissante avec la base",
+           f"{np.round(short, 3)} -> {np.round(long_, 3)}")
+
+    # Avec du bruit de pointage, l'erreur reelle doit rester du meme ordre que
+    # l'incertitude annoncee. Une incertitude qui ne predit pas l'erreur ne
+    # sert a rien -- pire, elle donne une confiance imméritee.
+    rng = np.random.default_rng(5)
+    Xn, sn, _ = fly(RayBundle(capacity=32, sigma_px=0.6), 14, noise_px=0.6, rng=rng)
+    real = np.linalg.norm(Xn - truth, axis=1)
+    _check(bool(np.all(real < 3.0 * sn)), "erreur reelle compatible avec l'incertitude",
+           f"erreur {np.round(real, 3)} contre sigma {np.round(sn, 3)}")
+
+    # Deux visees quasi confondues ne doivent rien produire de credible.
+    still = RayBundle(capacity=32, sigma_px=0.6)
+    for _ in range(6):
+        pos = np.array([0.0, 0.0, height])
+        cam = (truth - pos) @ R_bc
+        uv = np.column_stack([cam[:, 0] / cam[:, 2] * K.fx + K.cx,
+                              cam[:, 1] / cam[:, 2] * K.fy + K.cy])
+        rows = still.observe(ids, pos, geometry.rays_body(uv, K, R_bc))
+    _, _, mask = still.solve(rows, min_views=3, max_sigma_m=0.6, focal_px=K.fx)
+    _check(not mask.any(), "aucune base -> aucun point accepte",
+           f"{int(mask.sum())} points retenus")
+
+
+def test_imu_fusion() -> None:
+    """Une centrale inertielle, si elle existe, doit freiner la derive de cap.
+
+    Le cap est la seule grandeur que rien n'observe dans ce systeme: il
+    s'integre, donc il derive, et aucune image ne le recale. C'est en virage
+    que cela se voit -- le lacet visuel accumule alors son erreur a chaque
+    image. Le test compare le meme vol avec et sans gyrometre.
+    """
+    print("\n-- fusion inertielle ----------------------------------------")
+    from invis.mapper import Mapper
+    from invis.simulator import FlightSimulator, Wall
+
+    def fly(with_imu: bool):
+        sim = FlightSimulator(height_m=2.0, speed_mps=0.8, yaw_rate_dps=12.0,
+                              walls=[Wall(x_m=6.0, width_m=1.6, height_m=1.4)])
+        det = ObstacleDetector()
+        mapper = Mapper(height_m=2.0)
+        rng = np.random.default_rng(17)
+        errors = []
+        for k in range(int(6.0 * FPS_SIM)):
+            t = k / FPS_SIM
+            img = sim.render(t)
+            if with_imu:
+                # Gyrometre realiste: bruite et biaise, pas parfait.
+                mapper.push_imu(sim.imu(t, rng=rng, gyro_sigma_dps=0.8,
+                                        gyro_bias_dps=0.3, attitude=False))
+            frame = mapper.update(det.process(img, t), img)
+            errors.append(abs(frame.yaw_deg - math.degrees(sim.yaw_rad(t))))
+        return float(np.mean(errors[-10:]))
+
+    without = fly(False)
+    with_ = fly(True)
+    _check(with_ < without, "le gyrometre reduit l'erreur de cap",
+           f"{without:.2f} deg sans -> {with_:.2f} deg avec")
+    _check(with_ < 3.0, "cap tenu en virage avec gyrometre", f"{with_:.2f} deg")
+
+    # L'assiette inertielle doit rendre la reconstruction insensible a
+    # l'obstacle qui remplit l'image -- la faiblesse corrigee par ailleurs a
+    # coups de seuils devient ici sans objet.
+    sim = FlightSimulator(height_m=2.5, speed_mps=0.6,
+                          walls=[Wall(x_m=6.0, width_m=1.6, height_m=1.4)])
+    det = ObstacleDetector()
+    mapper = Mapper(height_m=2.5)
+    drift = 0.0
+    for k in range(int((5.5 / 0.6) * FPS_SIM)):
+        t = k / FPS_SIM
+        img = sim.render(t)
+        mapper.push_imu(sim.imu(t, attitude=True))
+        frame = mapper.update(det.process(img, t), img)
+        drift = max(drift, abs(frame.tilt_deg - sim.tilt_deg))
+    _check(drift < 0.01, "assiette inertielle: aucune derive de tangage",
+           f"ecart max {drift:.4f} deg")
+
+
+def test_loop_closure() -> None:
+    """Repasser au meme endroit doit recaler la position, pas la degrader.
+
+    Le vol est un cercle complet: le drone revient exactement a son point de
+    depart, ce que l'odometrie seule ignore. C'est la seule situation ou une
+    information nouvelle apparait sans nouveau capteur.
+    """
+    print("\n-- fermeture de boucle --------------------------------------")
+    from invis import config as cfg
+    from invis.loop import LoopCloser, descriptor, ground_patch
+    from invis.geometry import Intrinsics
+    from invis.mapper import Mapper
+    from invis.simulator import FlightSimulator
+
+    # 1) La vignette de sol doit etre la meme quel que soit le cap: c'est la
+    #    propriete sur laquelle repose toute la reconnaissance.
+    K = Intrinsics.from_fov(W, H)
+    rng = np.random.default_rng(4)
+    scene = cv2.GaussianBlur(rng.integers(0, 255, size=(H, W), dtype=np.uint8), (5, 5), 0)
+    p0 = ground_patch(scene, K, 2.0, -45.0, 0.0, 0.0)
+    _check(p0 is not None and float(p0.std()) > 5.0,
+           "vignette de sol construite", f"ecart-type {p0.std():.1f}" if p0 is not None else "None")
+    _check(descriptor(p0) is not None, "descripteur extrait de la vignette")
+
+    # 2) Recalage sur decalage connu, dans les deux axes.
+    closer = LoopCloser()
+    res = cfg.LOOP_PATCH_SPAN_M / cfg.LOOP_PATCH_PX
+    big = cv2.GaussianBlur(rng.integers(0, 255, size=(400, 400), dtype=np.uint8), (5, 5), 0)
+    N = cfg.LOOP_PATCH_PX
+
+    def crop(px, py):
+        x0 = int(round(200 + px / res - N / 2))
+        y0 = int(round(200 + py / res - N / 2))
+        return big[y0:y0 + N, x0:x0 + N].copy()
+
+    errs = []
+    for dx, dy in ((0.5, 0.0), (0.0, 0.5), (-0.75, 0.25), (1.0, -1.0)):
+        out = closer._align(crop(0.0, 0.0), crop(dx, dy))
+        if out is None:
+            errs.append(float("inf"))
+            continue
+        errs.append(float(np.linalg.norm(out[0] - np.array([dx, dy]))))
+    _check(max(errs) < 0.10, "decalage retrouve dans les deux axes",
+           f"erreur max {max(errs):.3f} m sur {len(errs)} essais")
+
+    # 3) Vol circulaire complet: le drone revient sur ses traces.
+    def fly(enabled: bool) -> float:
+        saved, cfg.LOOP_ENABLED = cfg.LOOP_ENABLED, enabled
+        try:
+            sim = FlightSimulator(height_m=2.0, speed_mps=0.8, yaw_rate_dps=30.0, walls=[])
+            det = ObstacleDetector()
+            mapper = Mapper(height_m=2.0)
+            turn_s = 360.0 / 30.0
+            for k in range(int(turn_s * FPS_SIM * 1.05)):
+                t = k / FPS_SIM
+                mapper.update(det.process(sim.render(t), t))
+            truth = sim.truth(t)
+            error = float(np.hypot(mapper._pos[0] - truth.camera_x,
+                                   mapper._pos[1] - truth.camera_y))
+            return error, mapper.loop_matches, len(mapper._closer)
+        finally:
+            cfg.LOOP_ENABLED = saved
+
+    without, _, _ = fly(False)
+    with_, matches, places = fly(True)
+    _check(places > 10, "lieux memorises le long du parcours", f"{places} cles")
+    _check(matches > 0, "boucle effectivement reconnue au retour",
+           f"{matches} fermetures acceptees par le filtre")
+    _check(with_ <= without, "la fermeture ne degrade jamais la position",
+           f"{without:.2f} m sans -> {with_:.2f} m avec")
+
+
+def test_attitude_robustness() -> None:
+    """L'assiette ne doit pas suivre l'obstacle qui grandit dans l'image.
+
+    Un mur encore lointain se plie a l'homographie du sol -- sa parallaxe est
+    trop faible pour l'en distinguer -- tout en tirant la normale ajustee vers
+    lui. Le tangage derivait ainsi de plusieurs degres pendant l'approche, ce
+    qui se payait en dizaines de centimetres sur la distance annoncee.
+    """
+    print("\n-- stabilite de l'assiette ----------------------------------")
+    from invis.mapper import Mapper
+    from invis.simulator import FlightSimulator, Wall
+
+    sim = FlightSimulator(height_m=2.5, speed_mps=0.6,
+                          walls=[Wall(x_m=6.0, width_m=1.6, height_m=1.4)])
+    det = ObstacleDetector()
+    mapper = Mapper(height_m=2.5)
+    tilts = []
+    for k in range(int((5.5 / 0.6) * FPS_SIM)):
+        t = k / FPS_SIM
+        img = sim.render(t)
+        tilts.append(mapper.update(det.process(img, t), img).tilt_deg)
+
+    drift = max(abs(v - sim.tilt_deg) for v in tilts)
+    _check(drift < 1.5, "tangage stable pendant toute l'approche",
+           f"ecart max {drift:.2f} deg (mesure a 4.5 deg avant durcissement)")
+
+
+def test_clusters_and_alert() -> None:
+    """Deux obstacles separes doivent se compter comme deux, avec leur distance.
+
+    La grille 3x3 disait dans quelle case de l'image il y avait du relief. Ce
+    n'est ni un objet ni une distance: deux poteaux de part et d'autre du
+    couloir donnaient la meme lecture qu'un mur en travers.
+    """
+    print("\n-- objets distincts et alerte -------------------------------")
+    from invis.mapper import Mapper
+    from invis.simulator import FlightSimulator, Wall
+
+    # Les deux poteaux sont places dans la portee reelle du montage: a 45
+    # degres de piquage la camera ne voit le sol que jusqu'a environ 2,2 fois
+    # la hauteur de vol, soit 4,4 m ici. Plus loin, il n'y a rien a detecter.
+    sim = FlightSimulator(height_m=2.0, speed_mps=0.8, walls=[
+        Wall(x_m=4.0, y_m=-1.2, width_m=0.6, height_m=1.3),
+        Wall(x_m=4.0, y_m=+1.2, width_m=0.6, height_m=1.3),
+    ])
+    det = ObstacleDetector()
+    mapper = Mapper(height_m=2.0)
+    seen_two = 0
+    frames = 0
+    forward_always = True
+    for k in range(int((3.4 / 0.8) * FPS_SIM)):
+        t = k / FPS_SIM
+        img = sim.render(t)
+        frame = mapper.update(det.process(img, t), img)
+        if frame.clusters:
+            frames += 1
+            if len(frame.clusters) >= 2:
+                seen_two += 1
+        if frame.ok and not math.isfinite(frame.forward_m):
+            forward_always = False
+
+    _check(frames > 0, "des objets sont detectes", f"{frames} images avec objets")
+    _check(seen_two >= max(1, frames // 4), "les deux poteaux comptent pour deux",
+           f"{seen_two}/{frames} images voient au moins deux objets")
+    _check(forward_always, "la distance droit devant est toujours renseignee",
+           "sol a defaut d'obstacle")
+
+    # Un mur en travers doit, lui, declencher l'alerte de couloir.
+    sim = FlightSimulator(height_m=2.0, speed_mps=0.8,
+                          walls=[Wall(x_m=4.0, width_m=2.4, height_m=1.4)])
+    det = ObstacleDetector()
+    mapper = Mapper(height_m=2.0)
+    levels, corridor = [], 0
+    for k in range(int((3.4 / 0.8) * FPS_SIM)):
+        t = k / FPS_SIM
+        frame = mapper.update(det.process(sim.render(t), t))
+        levels.append(frame.alert_level)
+        corridor += any(c.in_corridor for c in frame.clusters)
+    _check(corridor > 0, "mur en travers reconnu comme coupant le couloir",
+           f"{corridor} images")
+    _check(max(levels) >= 2, "alerte de danger levee a l'approche",
+           f"niveau max {max(levels)}")
+    _check(levels[0] == 0, "aucune alerte au depart, loin du mur")
+
+
+def test_ui_threading() -> None:
+    """Le fil d'analyse ne doit jamais appeler Tcl.
+
+    L'interpreteur Tcl derriere Tkinter n'est pas concu pour etre appele depuis
+    plusieurs fils. Lire une variable Tk depuis le fil d'analyse ressemble a une
+    lecture anodine mais c'est un appel dans Tcl: selon le moment il rend la
+    bonne valeur, il leve "main thread is not in main loop", ou il corrompt
+    l'etat de l'interpreteur. Cela fonctionnait par chance, l'appel tombant
+    presque toujours pendant que le fil principal attendait.
+
+    Le test rend la faute systematique: une boucle `update()` sans `mainloop()`
+    garde le fil principal hors de la boucle Tcl, et toute lecture depuis le
+    fil d'analyse echoue alors a coup sur. Avant correction, le fil mourait en
+    quelques dixiemes de seconde.
+    """
+    print("\n-- cloisonnement des fils de l'interface --------------------")
+    try:
+        import tkinter
+        tkinter.Tk().destroy()
+    except Exception as exc:  # noqa: BLE001
+        print(f"IGNORE cloisonnement des fils              (Tk indisponible: {exc})")
+        return
+
+    import threading
+    from invis.gcs_vision import VisionApp
+
+    faults = []
+    previous = threading.excepthook
+    threading.excepthook = lambda args: faults.append(args.exc_value) or previous(args)
+    try:
+        app = VisionApp(host="127.0.0.1", source="sim")
+        app.withdraw()
+        app.update()
+        app._connect()
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            app.update()
+            time.sleep(0.02)
+        alive = bool(app._worker and app._worker.is_alive())
+        mapframe = app._last_mapframe
+        app._disconnect()
+        app.destroy()
+    finally:
+        threading.excepthook = previous
+
+    _check(not faults, "aucune exception dans le fil d'analyse",
+           repr(faults[0]) if faults else "")
+    _check(alive, "le fil d'analyse survit a la boucle d'affichage")
+    _check(mapframe is not None and mapframe.n_cells > 0,
+           "la reconstruction avance malgre le cloisonnement",
+           f"{mapframe.n_cells} cases" if mapframe else "aucune image analysee")
+
+
+def test_elevation_grid() -> None:
+    """La carte d'elevation doit moyenner, se recentrer et rester bornee."""
+    print("\n-- carte d'elevation ----------------------------------------")
+    from invis import config as cfg
+    from invis.grid import ElevationGrid
+
+    grid = ElevationGrid(cells=64, resolution_m=0.10)
+    grid.recentre(np.zeros(2))
+
+    # 1) Hauteur et couleur retrouvees, bruit moyenne.
+    rng = np.random.default_rng(21)
+    target_z, target_c = 0.7, np.array([40.0, 90.0, 200.0])
+    for _ in range(20):
+        pts = np.zeros((50, 3))
+        pts[:, 0] = 0.15
+        pts[:, 1] = -0.25
+        pts[:, 2] = target_z + rng.normal(0.0, 0.05, size=50)
+        cols = np.clip(target_c + rng.normal(0.0, 20.0, size=(50, 3)), 0, 255)
+        grid.add(pts, 1.0, cols)
+
+    got = grid.height_at(np.array([[0.15, -0.25]]))[0]
+    _check(abs(got - target_z) < 0.02, "hauteur moyennee sur les mesures repetees",
+           f"{got:.3f} m pour {target_z} m")
+    centres, colours, shade = grid.surface(min_count=1)
+    _check(len(centres) == 1, "une seule case renseignee", f"{len(centres)} cases")
+    _check(float(np.abs(colours[0] - target_c).max()) < 12.0,
+           "couleur moyennee sur les mesures repetees", f"{np.round(colours[0], 1)}")
+
+    # 2) Une case jamais vue ne repond pas: l'ignorance doit se dire.
+    unseen = grid.height_at(np.array([[2.0, 2.0]]))[0]
+    _check(np.isnan(unseen), "case jamais observee -> pas de hauteur inventee")
+
+    # 3) Recentrage: le contenu doit designer le meme terrain apres decalage.
+    moved = grid.recentre(np.array([2.5, 0.0]))
+    still = grid.height_at(np.array([[0.15, -0.25]]))[0]
+    _check(moved, "recentrage declenche par l'eloignement")
+    _check(abs(still - target_z) < 0.02,
+           "le terrain reste au meme endroit apres recentrage",
+           f"{still:.3f} m" if np.isfinite(still) else "perdu")
+
+    # 4) Ce qui entre par un bord doit etre vide, pas recopie de l'autre bord.
+    behind = grid.height_at(np.array([[5.4, 0.0]]))[0]
+    _check(np.isnan(behind), "le terrain ne reapparait pas par le bord oppose",
+           "NaN" if np.isnan(behind) else f"{behind:.3f}")
+
+    # 5) Memoire bornee: repasser cent fois n'ajoute pas de case.
+    before = len(grid)
+    for _ in range(100):
+        grid.add(np.array([[2.5, 0.05, 0.3]]), 2.0)
+    _check(len(grid) == before + 1, "memoire bornee par le terrain, pas par la duree",
+           f"{before} -> {len(grid)} cases")
+
+    # 6) Ombrage: un plan doit s'eclairer uniformement, une pente non.
+    flat = ElevationGrid(cells=32, resolution_m=0.10)
+    flat.recentre(np.zeros(2))
+    xs, ys = np.meshgrid(np.linspace(-1.0, 1.0, 40), np.linspace(-1.0, 1.0, 40))
+    plane = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+    flat.add(plane, 1.0)
+    _, _, sh_flat = flat.surface(min_count=1)
+
+    slope = ElevationGrid(cells=32, resolution_m=0.10)
+    slope.recentre(np.zeros(2))
+    ramp = plane.copy()
+    ramp[:, 2] = 0.5 * ramp[:, 0]
+    slope.add(ramp, 1.0)
+    _, _, sh_slope = slope.surface(min_count=1)
+    _check(float(sh_flat.std()) < 1e-3 < float(np.abs(sh_slope.mean() - sh_flat.mean())),
+           "l'ombrage ne reagit qu'au relief",
+           f"plat sigma={sh_flat.std():.4f}, pente ecart={abs(sh_slope.mean()-sh_flat.mean()):.3f}")
 
 
 def test_scale_invariance() -> None:
@@ -897,6 +1356,14 @@ def main() -> int:
     test_pose_convention()
     test_detector()
     test_frame_quality()
+    test_fusion()
+    test_structure()
+    test_imu_fusion()
+    test_loop_closure()
+    test_elevation_grid()
+    test_clusters_and_alert()
+    test_ui_threading()
+    test_attitude_robustness()
     test_metric_reconstruction()
     test_scale_invariance()
     test_rendering()

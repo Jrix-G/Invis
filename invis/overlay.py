@@ -20,6 +20,7 @@ COLOR_HORIZON = (200, 200, 60)
 COLOR_TEXT = (245, 245, 245)
 COLOR_RANGE = (185, 165, 90)
 COLOR_CONTACT = (60, 200, 255)
+COLOR_CLUSTER = (120, 210, 120)
 
 
 def draw(frame: np.ndarray, result: DetectionResult, show_flow: bool = True,
@@ -58,7 +59,10 @@ def draw(frame: np.ndarray, result: DetectionResult, show_flow: bool = True,
     _draw_cells(out, result, w, h)
     if mapframe is not None:
         _draw_contact(out, mapframe, w, h)
+        _draw_clusters(out, mapframe, w, h, s)
     _draw_hud(out, result, w, h, mapframe)
+    if mapframe is not None:
+        _draw_alert(out, mapframe, w, h)
     if stale:
         # L'image est affichee mais n'a pas ete analysee: les mesures montrees
         # datent de l'image precedente. Le dire, sinon elles passent pour
@@ -99,6 +103,75 @@ def _draw_contact(img: np.ndarray, mapframe, w: int, h: int) -> None:
     label = f"contact {mapframe.contact.range_m:.2f} m"
     cv2.putText(img, label, (w - 118, max(11, y - 4)), cv2.FONT_HERSHEY_SIMPLEX,
                 0.36, COLOR_CONTACT, 1, cv2.LINE_AA)
+
+
+def _draw_clusters(img: np.ndarray, mapframe, w: int, h: int, scale: float) -> None:
+    """Boite et distance pour chaque objet distinct.
+
+    C'est ce qui manquait pour rendre la mesure utilisable: la grille 3x3
+    disait dans quelle case de l'image il y avait du relief, ce qui ne designe
+    pas un objet et ne donne pas sa distance. Une boite autour de chaque objet,
+    avec sa distance ecrite dessus, repond directement -- et distingue deux
+    objets que la grille fondait en un seul.
+    """
+    clusters = getattr(mapframe, "clusters", None)
+    if not clusters:
+        return
+    for rank, cluster in enumerate(clusters):
+        x0, y0, x1, y1 = cluster.bbox
+        if x1 <= x0 or y1 <= y0:
+            continue
+        a = (int(x0 * scale), int(y0 * scale))
+        b = (int(x1 * scale), int(y1 * scale))
+        # Le plus proche du couloir se distingue: c'est le seul sur lequel il y
+        # a une decision a prendre.
+        first = cluster.in_corridor and rank == 0
+        colour = COLOR_CONFIRMED if first else COLOR_CLUSTER
+        cv2.rectangle(img, a, b, colour, 2 if first else 1)
+
+        label = f"{cluster.range_m:.2f} m"
+        if cluster.sigma_m > 0.01:
+            label += f" +/-{cluster.sigma_m:.2f}"
+        ty = max(12, a[1] - 5)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        # Ramene dans le cadre: un objet detecte au bord droit de l'image y
+        # voyait sa distance tronquee, c'est-a-dire perdue, et c'est justement
+        # la que passent les obstacles qu'on frole.
+        tx = int(np.clip(a[0], 0, max(0, w - tw - 6)))
+        # Fond opaque: sans lui le texte devient illisible des que l'objet est
+        # clair, ce qui arrive exactement quand il est proche et eclaire.
+        cv2.rectangle(img, (tx, ty - th - 3), (tx + tw + 4, ty + 3), (0, 0, 0), -1)
+        cv2.putText(img, label, (tx + 2, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    colour, 1, cv2.LINE_AA)
+
+
+def _draw_alert(img: np.ndarray, mapframe, w: int, h: int) -> None:
+    """Cadre de proximite et distance droit devant.
+
+    Le cadre entoure toute l'image plutot que d'ajouter une ligne de texte:
+    une alerte doit se voir sans etre lue, y compris du coin de l'oeil pendant
+    qu'on regarde ailleurs.
+    """
+    level = getattr(mapframe, "alert_level", 0)
+    forward = getattr(mapframe, "forward_m", float("nan"))
+
+    if np.isfinite(forward):
+        text = (f"devant: obstacle a {forward:.2f} m" if mapframe.forward_is_obstacle
+                else f"devant: libre jusqu'a {forward:.2f} m")
+        cv2.putText(img, text, (w - 178, h - 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, COLOR_TEXT, 1, cv2.LINE_AA)
+
+    if level <= 0:
+        return
+    colour = COLOR_CONFIRMED if level >= 2 else COLOR_HIT
+    thickness = 6 if level >= 2 else 3
+    cv2.rectangle(img, (0, 0), (w - 1, h - 1), colour, thickness)
+    banner = ("DANGER  " if level >= 2 else "PROXIMITE  ") + mapframe.alert_reason
+    (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+    x = max(4, (w - tw) // 2)
+    cv2.rectangle(img, (x - 6, 22), (x + tw + 6, 26 + th + 6), (0, 0, 0), -1)
+    cv2.putText(img, banner, (x, 26 + th), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                colour, 2, cv2.LINE_AA)
 
 
 def _draw_grid(img: np.ndarray, w: int, h: int) -> None:
