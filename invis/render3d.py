@@ -28,6 +28,30 @@ COLOR_DRONE = (250, 250, 250)
 COLOR_TEXT = (215, 215, 215)
 COLOR_DIM = (130, 130, 138)
 
+# Modes de couleur. Chacun repond a une question differente: a quoi ressemble
+# le terrain, quel est son relief, et jusqu'ou peut-on croire ce qu'on voit.
+MODE_REAL = "reelle"
+MODE_HEIGHT = "hauteur"
+MODE_CONFIDENCE = "fiabilite"
+MODE_PLAIN = "uniforme"
+COLOUR_MODES = (MODE_REAL, MODE_HEIGHT, MODE_CONFIDENCE, MODE_PLAIN)
+
+
+def _ramp(t: np.ndarray) -> np.ndarray:
+    """Degrade bleu -> vert -> jaune, en BGR.
+
+    Choisi pour rester lisible en luminance croissante: le bleu sombre se lit
+    comme "bas" ou "douteux" et le jaune clair comme "haut" ou "sur", y compris
+    pour un oeil qui distingue mal le rouge du vert.
+    """
+    t = np.clip(np.asarray(t, dtype=np.float32), 0.0, 1.0)[:, None]
+    cold = np.array([140.0, 60.0, 30.0], dtype=np.float32)
+    mid = np.array([90.0, 190.0, 80.0], dtype=np.float32)
+    hot = np.array([70.0, 235.0, 245.0], dtype=np.float32)
+    lower = cold + (mid - cold) * np.clip(t * 2.0, 0.0, 1.0)
+    upper = mid + (hot - mid) * np.clip(t * 2.0 - 1.0, 0.0, 1.0)
+    return np.where(t < 0.5, lower, upper)
+
 
 @dataclass
 class OrbitCamera:
@@ -102,6 +126,8 @@ class Renderer3D:
         self._canvas = np.empty((self.height, self.width, 3), dtype=np.uint8)
         self.auto_follow = True
         self.spin_dps = 0.0
+        self.show_surface = True
+        self.colour_mode = MODE_REAL
 
     def resize(self, width: int, height: int) -> None:
         if width == self.width and height == self.height:
@@ -159,6 +185,8 @@ class Renderer3D:
         R, eye, f = self.camera.matrices(self.width, self.height)
 
         self._draw_grid(img, R, eye, f, centre=pos)
+        if self.show_surface and getattr(mapper, "grid", None) is not None:
+            self._draw_surface(img, mapper.grid, R, eye, f)
         self._draw_cloud(img, mapper, R, eye, f)
         self._draw_trajectory(img, mapper, R, eye, f)
         if frame is not None:
@@ -193,9 +221,92 @@ class Renderer3D:
             cv2.line(img, (us[i], vs[i]), (ue[i], ve[i]),
                      COLOR_GRID_MAIN if main else COLOR_GRID, 1, cv2.LINE_AA)
 
+    def _draw_surface(self, img: np.ndarray, grid, R: np.ndarray, eye: np.ndarray,
+                      f: float) -> None:
+        """Dessine la carte d'elevation comme une surface, non comme des points.
+
+        Chaque case est etalee sur autant de pixels qu'elle en couvre
+        reellement -- une case de dix centimetres vue a huit metres en occupe
+        environ quatre. Sans cet etalement la surface se lirait comme un semis
+        troue des qu'on s'approche, et comme une bouillie des qu'on s'eloigne.
+
+        L'ordre de dessin resout l'occultation sans tampon de profondeur. La
+        taille d'une case a l'ecran ne depend que de sa distance: dessiner par
+        taille croissante, c'est dessiner du plus lointain au plus proche. Le
+        recouvrement se fait donc dans le bon sens, gratuitement, la ou un vrai
+        tampon de profondeur couterait une comparaison par pixel.
+        """
+        centres, colours, shade = grid.surface(min_count=config.SURFACE_MIN_COUNT)
+        if len(centres) == 0:
+            return
+
+        cam = (centres.astype(np.float64) - eye) @ R.T
+        z = cam[:, 2]
+        visible = z > 0.05
+        if not visible.any():
+            return
+
+        u = np.zeros(len(centres))
+        v = np.zeros(len(centres))
+        np.divide(cam[:, 0] * f, z, out=u, where=visible)
+        np.divide(cam[:, 1] * f, z, out=v, where=visible)
+        ui = (u + self.width / 2.0).astype(np.int32)
+        vi = (v + self.height / 2.0).astype(np.int32)
+        visible &= (ui >= 0) & (ui < self.width) & (vi >= 0) & (vi < self.height)
+        if not visible.any():
+            return
+
+        rgb = self._surface_colour(centres, colours, shade)
+
+        # Rayon arrondi *par exces*. Deux cases voisines sont separees a
+        # l'ecran de f*res/z pixels; un rayon tronque laisse alors une ligne
+        # vide sur deux, et la surface se couvre d'un damier qui n'existe pas.
+        # Arrondir au-dessus garantit que les etalements se touchent.
+        tmp = np.zeros(len(centres))
+        np.divide(f * grid.res, 2.0 * np.maximum(z, 1e-6), out=tmp, where=visible)
+        np.clip(np.ceil(tmp), 0, config.SURFACE_MAX_SPLAT_PX, out=tmp)
+        half = np.zeros(len(centres), dtype=np.int32)
+        half[visible] = tmp[visible].astype(np.int32)
+
+        for radius in np.unique(half[visible]):
+            sel = np.flatnonzero(visible & (half == radius))
+            if len(sel) == 0:
+                continue
+            colour = rgb[sel]
+            su, sv = ui[sel], vi[sel]
+            for dv in range(-int(radius), int(radius) + 1):
+                rows = np.clip(sv + dv, 0, self.height - 1)
+                for du in range(-int(radius), int(radius) + 1):
+                    img[rows, np.clip(su + du, 0, self.width - 1)] = colour
+
+    def _surface_colour(self, centres: np.ndarray, colours: np.ndarray,
+                        shade: np.ndarray) -> np.ndarray:
+        """Couleur finale des cases, selon le mode d'affichage choisi.
+
+        Le mode n'est pas un ornement. La couleur reelle sert a reconnaitre le
+        terrain, la hauteur a lire le relief la ou la texture est uniforme, et
+        la fiabilite a savoir ce qu'on regarde -- une surface bien mesuree ou
+        une extrapolation. Aucun de ces trois besoins ne se satisfait des deux
+        autres.
+        """
+        if self.colour_mode == MODE_HEIGHT:
+            # Echelle fixe, jamais ajustee sur le contenu. Une normalisation
+            # entre le minimum et le maximum vus donnerait une couleur qui
+            # change de signification a chaque image, et peindrait un sol plat
+            # comme s'il etait accidente. Ici une couleur vaut toujours la meme
+            # hauteur, et un terrain plat se voit comme plat.
+            t = centres[:, 2] / config.SURFACE_HEIGHT_SPAN_M
+            base = _ramp(t)
+        elif self.colour_mode == MODE_PLAIN:
+            base = np.tile(np.array(COLOR_GROUND_PT, dtype=np.float32), (len(centres), 1))
+        else:
+            base = colours
+        out = base * shade[:, None]
+        return np.clip(out, 0, 255).astype(np.uint8)
+
     def _draw_cloud(self, img: np.ndarray, mapper, R: np.ndarray, eye: np.ndarray,
                     f: float) -> None:
-        xyz, kind, _stamp = mapper.cloud.view()
+        xyz, kind, _stamp, sigma, bgr = mapper.cloud.view_full()
         if len(xyz) == 0:
             return
         u, v, ok = self._project(xyz.astype(np.float64), R, eye, f)
@@ -205,6 +316,11 @@ class Renderer3D:
         ground = ok & (kind == KIND_GROUND)
         obstacle = ok & (kind == KIND_OBSTACLE)
 
+        # Le sol du nuage disparait quand la surface est affichee: elle dit la
+        # meme chose en mieux, et les deux superposes se brouillent.
+        if self.show_surface:
+            ground[:] = False
+
         # Ecriture directe: une passe numpy par categorie, sans boucle Python.
         if ground.any():
             img[v[ground], u[ground]] = COLOR_GROUND_PT
@@ -212,11 +328,28 @@ class Renderer3D:
             # Les obstacles comptent plus que le sol: on les epaissit pour
             # qu'ils restent lisibles quand le nuage de sol est dense.
             uu, vv = u[obstacle], v[obstacle]
-            img[vv, uu] = COLOR_OBSTACLE_PT
+            colour = self._obstacle_colour(sigma[obstacle], bgr[obstacle])
+            img[vv, uu] = colour
             for du, dv in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 nu = np.clip(uu + du, 0, self.width - 1)
                 nv = np.clip(vv + dv, 0, self.height - 1)
-                img[nv, nu] = COLOR_OBSTACLE_PT
+                img[nv, nu] = colour
+
+    def _obstacle_colour(self, sigma: np.ndarray, bgr: np.ndarray) -> np.ndarray:
+        """Couleur des points de relief.
+
+        En mode fiabilite, elle repond a une question que le nuage ne posait
+        pas: ce point-la, le croit-on? Un obstacle reconstruit avec vingt
+        centimetres d'incertitude et un autre avec deux se ressemblaient
+        exactement a l'ecran, alors qu'on n'agit pas de la meme facon sur les
+        deux.
+        """
+        if self.colour_mode == MODE_CONFIDENCE:
+            t = np.clip(sigma / max(1e-6, config.STRUCTURE_MAX_SIGMA_M), 0.0, 1.0)
+            return _ramp(1.0 - t).astype(np.uint8)
+        if self.colour_mode == MODE_REAL:
+            return bgr
+        return np.array(COLOR_OBSTACLE_PT, dtype=np.uint8)
 
     def _draw_trajectory(self, img: np.ndarray, mapper, R: np.ndarray,
                          eye: np.ndarray, f: float) -> None:
@@ -255,8 +388,13 @@ class Renderer3D:
         cv2.circle(img, (u[0], v[0]), 3, COLOR_DRONE, -1, cv2.LINE_AA)
 
     def _draw_legend(self, img: np.ndarray, mapper, frame) -> None:
-        cv2.putText(img, f"nuage {len(mapper.cloud)} pts", (6, 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, COLOR_TEXT, 1, cv2.LINE_AA)
+        cells = len(mapper.grid) if getattr(mapper, "grid", None) is not None else 0
+        head = (f"surface {cells} cases  |  relief {len(mapper.cloud)} pts"
+                if self.show_surface else f"nuage {len(mapper.cloud)} pts")
+        cv2.putText(img, head, (6, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                    COLOR_TEXT, 1, cv2.LINE_AA)
+        cv2.putText(img, f"couleur: {self.colour_mode}", (6, 27),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, COLOR_DIM, 1, cv2.LINE_AA)
         cv2.putText(img, "sol", (6, self.height - 18), cv2.FONT_HERSHEY_SIMPLEX,
                     0.36, COLOR_GROUND_PT, 1, cv2.LINE_AA)
         cv2.putText(img, "obstacle", (44, self.height - 18), cv2.FONT_HERSHEY_SIMPLEX,

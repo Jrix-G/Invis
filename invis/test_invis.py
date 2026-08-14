@@ -685,6 +685,77 @@ def test_attitude_robustness() -> None:
            f"ecart max {drift:.2f} deg (mesure a 4.5 deg avant durcissement)")
 
 
+def test_elevation_grid() -> None:
+    """La carte d'elevation doit moyenner, se recentrer et rester bornee."""
+    print("\n-- carte d'elevation ----------------------------------------")
+    from invis import config as cfg
+    from invis.grid import ElevationGrid
+
+    grid = ElevationGrid(cells=64, resolution_m=0.10)
+    grid.recentre(np.zeros(2))
+
+    # 1) Hauteur et couleur retrouvees, bruit moyenne.
+    rng = np.random.default_rng(21)
+    target_z, target_c = 0.7, np.array([40.0, 90.0, 200.0])
+    for _ in range(20):
+        pts = np.zeros((50, 3))
+        pts[:, 0] = 0.15
+        pts[:, 1] = -0.25
+        pts[:, 2] = target_z + rng.normal(0.0, 0.05, size=50)
+        cols = np.clip(target_c + rng.normal(0.0, 20.0, size=(50, 3)), 0, 255)
+        grid.add(pts, 1.0, cols)
+
+    got = grid.height_at(np.array([[0.15, -0.25]]))[0]
+    _check(abs(got - target_z) < 0.02, "hauteur moyennee sur les mesures repetees",
+           f"{got:.3f} m pour {target_z} m")
+    centres, colours, shade = grid.surface(min_count=1)
+    _check(len(centres) == 1, "une seule case renseignee", f"{len(centres)} cases")
+    _check(float(np.abs(colours[0] - target_c).max()) < 12.0,
+           "couleur moyennee sur les mesures repetees", f"{np.round(colours[0], 1)}")
+
+    # 2) Une case jamais vue ne repond pas: l'ignorance doit se dire.
+    unseen = grid.height_at(np.array([[2.0, 2.0]]))[0]
+    _check(np.isnan(unseen), "case jamais observee -> pas de hauteur inventee")
+
+    # 3) Recentrage: le contenu doit designer le meme terrain apres decalage.
+    moved = grid.recentre(np.array([2.5, 0.0]))
+    still = grid.height_at(np.array([[0.15, -0.25]]))[0]
+    _check(moved, "recentrage declenche par l'eloignement")
+    _check(abs(still - target_z) < 0.02,
+           "le terrain reste au meme endroit apres recentrage",
+           f"{still:.3f} m" if np.isfinite(still) else "perdu")
+
+    # 4) Ce qui entre par un bord doit etre vide, pas recopie de l'autre bord.
+    behind = grid.height_at(np.array([[5.4, 0.0]]))[0]
+    _check(np.isnan(behind), "le terrain ne reapparait pas par le bord oppose",
+           "NaN" if np.isnan(behind) else f"{behind:.3f}")
+
+    # 5) Memoire bornee: repasser cent fois n'ajoute pas de case.
+    before = len(grid)
+    for _ in range(100):
+        grid.add(np.array([[2.5, 0.05, 0.3]]), 2.0)
+    _check(len(grid) == before + 1, "memoire bornee par le terrain, pas par la duree",
+           f"{before} -> {len(grid)} cases")
+
+    # 6) Ombrage: un plan doit s'eclairer uniformement, une pente non.
+    flat = ElevationGrid(cells=32, resolution_m=0.10)
+    flat.recentre(np.zeros(2))
+    xs, ys = np.meshgrid(np.linspace(-1.0, 1.0, 40), np.linspace(-1.0, 1.0, 40))
+    plane = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+    flat.add(plane, 1.0)
+    _, _, sh_flat = flat.surface(min_count=1)
+
+    slope = ElevationGrid(cells=32, resolution_m=0.10)
+    slope.recentre(np.zeros(2))
+    ramp = plane.copy()
+    ramp[:, 2] = 0.5 * ramp[:, 0]
+    slope.add(ramp, 1.0)
+    _, _, sh_slope = slope.surface(min_count=1)
+    _check(float(sh_flat.std()) < 1e-3 < float(np.abs(sh_slope.mean() - sh_flat.mean())),
+           "l'ombrage ne reagit qu'au relief",
+           f"plat sigma={sh_flat.std():.4f}, pente ecart={abs(sh_slope.mean()-sh_flat.mean()):.3f}")
+
+
 def test_scale_invariance() -> None:
     """Une hauteur fausse doit tout multiplier, sans rien deformer."""
     print("\n-- effet d'une hauteur fausse -------------------------------")
@@ -1178,6 +1249,7 @@ def main() -> int:
     test_structure()
     test_imu_fusion()
     test_loop_closure()
+    test_elevation_grid()
     test_attitude_robustness()
     test_metric_reconstruction()
     test_scale_invariance()

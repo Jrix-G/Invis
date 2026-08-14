@@ -42,7 +42,7 @@ if __package__ in (None, ""):  # execution directe du fichier
     from invis.mapper import Mapper  # noqa: E402
     from invis.mjpeg_client import VideoLink, http_get  # noqa: E402
     from invis.recorder import SessionRecorder  # noqa: E402
-    from invis.render3d import Renderer3D  # noqa: E402
+    from invis.render3d import COLOUR_MODES, MODE_REAL, Renderer3D  # noqa: E402
     from invis.simulator import FlightSimulator, SimulatedLink, Wall  # noqa: E402
     from invis.updater import UpdateWatcher, install  # noqa: E402
     from invis.version import VERSION  # noqa: E402
@@ -53,7 +53,7 @@ else:
     from .mapper import Mapper
     from .mjpeg_client import VideoLink, http_get
     from .recorder import SessionRecorder
-    from .render3d import Renderer3D
+    from .render3d import COLOUR_MODES, MODE_REAL, Renderer3D
     from .simulator import FlightSimulator, SimulatedLink, Wall
     from .updater import UpdateWatcher, install
     from .version import VERSION
@@ -101,6 +101,8 @@ class VisionApp(tk.Tk):
         self.var_ranges = tk.BooleanVar(value=True)
         self.var_follow = tk.BooleanVar(value=True)
         self.var_spin = tk.BooleanVar(value=False)
+        self.var_surface = tk.BooleanVar(value=True)
+        self.var_colour = tk.StringVar(value=MODE_REAL)
         self.var_record = tk.BooleanVar(value=False)
         self.var_gate = tk.BooleanVar(value=True)
         self.var_flip_h = tk.BooleanVar(value=config.CAMERA_FLIP_H)
@@ -150,7 +152,12 @@ class VisionApp(tk.Tk):
         ttk.Checkbutton(top, text="Suivre", variable=self.var_follow,
                         command=self._apply_view).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Checkbutton(top, text="Rotation", variable=self.var_spin,
-                        command=self._apply_view).pack(side=tk.LEFT, padx=(6, 10))
+                        command=self._apply_view).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Checkbutton(top, text="Surface", variable=self.var_surface,
+                        command=self._apply_view).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Combobox(top, textvariable=self.var_colour, values=COLOUR_MODES,
+                     width=9, state="readonly").pack(side=tk.LEFT, padx=(6, 10))
+        self.var_colour.trace_add("write", lambda *_: self._apply_view())
         ttk.Button(top, text="Reset 3D", command=self._reset_map).pack(side=tk.LEFT)
         ttk.Checkbutton(top, text="Miroir H", variable=self.var_flip_h,
                         command=self._on_flip).pack(side=tk.LEFT, padx=(10, 0))
@@ -250,6 +257,8 @@ class VisionApp(tk.Tk):
     def _apply_view(self) -> None:
         self.renderer.auto_follow = self.var_follow.get()
         self.renderer.spin_dps = 12.0 if self.var_spin.get() else 0.0
+        self.renderer.show_surface = self.var_surface.get()
+        self.renderer.colour_mode = self.var_colour.get()
 
     def _reset_map(self) -> None:
         self.mapper.reset()

@@ -240,6 +240,60 @@ OBSTACLE_RANGE_QUANTILE = 0.15
 
 # Nuage de points: tampon circulaire, borne pour tenir la cadence.
 CLOUD_CAPACITY = 60000
+
+# ---------------------------------------------------------------------------
+# Carte d'elevation et densification du sol
+# ---------------------------------------------------------------------------
+
+# Taille de case, en metres. Dix centimetres: plus fin que cela, le bruit de
+# reconstruction depasse la taille de la case et le relief affiche serait du
+# bruit; plus grossier, un obstacle bas disparait dans la moyenne.
+GRID_RES_M = 0.10
+# Cote de la grille, en cases. 512 cases de 10 cm couvrent 51 m de cote, ce
+# qui depasse largement la portee utile de cette camera. La grille suit le
+# drone, donc cette valeur borne la memoire, pas la distance parcourue.
+GRID_CELLS = 512
+# Recentrage quand le drone depasse cette fraction du demi-cote.
+GRID_RECENTRE_FRACTION = 0.25
+# Poids plancher d'une mesure nouvelle. Sans plancher, une case tres observee
+# cesserait d'ecouter et ne se corrigerait plus jamais -- ni apres une
+# fermeture de boucle, ni si le terrain change.
+GRID_MIN_WEIGHT = 0.05
+# Direction de la lumiere du rendu ombre, et part de lumiere ambiante. Une
+# lumiere rasante fait ressortir le relief; l'ambiante evite que les faces
+# opposees deviennent illisibles.
+GRID_LIGHT = (-0.55, -0.35, 0.76)
+GRID_AMBIENT = 0.35
+# Nombre de mesures avant qu'une case soit affichee. Une case vue une seule
+# fois porte tout le bruit d'une seule mesure; en exiger deux supprime
+# l'essentiel du grésillement de la surface pour une image de retard.
+SURFACE_MIN_COUNT = 2
+# Taille maximale d'un etalement de case, en pixels de rayon. Sans plafond,
+# une case survolee de tres pres remplirait l'ecran.
+SURFACE_MAX_SPLAT_PX = 6
+# Hauteur correspondant au haut du degrade, en metres. Echelle fixe et non
+# ajustee sur le contenu: une couleur doit toujours vouloir dire la meme
+# hauteur, sinon un sol plat se peint comme un terrain accidente.
+SURFACE_HEIGHT_SPAN_M = 2.0
+
+# Densification du sol: un pixel sur N, en resolution de travail. Un point du
+# sol ne demande ni parallaxe ni suivi -- son rayon perce un plan connu -- donc
+# rien n'oblige a se limiter aux points suivis. Le pas fixe le compromis entre
+# densite de la surface et cout: 6 donne environ 2000 points par image pour le
+# prix d'une seule operation vectorisee.
+DENSE_ENABLED = True
+DENSE_STEP_PX = 6
+# Rayon d'exclusion autour d'un point signale hors sol, en pixels de travail.
+# La ou il y a du relief, l'intersection avec le plan poserait l'obstacle a
+# plat et derriere lui.
+DENSE_OBSTACLE_MARGIN_PX = 8
+# Portee au-dela de laquelle un point dense n'est pas verse: pres de
+# l'horizon, une erreur d'assiette d'un degre deplace le point de plusieurs
+# metres, et la surface se couvrirait d'un voile faux.
+DENSE_MAX_RANGE_M = 8.0
+# Marge sous l'horizon, en fraction de la hauteur d'image, ou l'on ne verse
+# rien: c'est la zone ou la geometrie devient indeterminee.
+DENSE_HORIZON_MARGIN = 0.10
 # Nombre de poses conservees pour la trajectoire affichee.
 TRAJECTORY_CAPACITY = 4000
 

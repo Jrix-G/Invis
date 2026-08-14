@@ -36,8 +36,11 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+import cv2
+
 from . import config, geometry, loop
 from .detector import STATE_NO_FLOW, DetectionResult
+from .grid import ElevationGrid
 from .loop import LoopCloser
 from .fusion import ConstantVelocity, HeadingFilter, wrap_angle
 from .geometry import Intrinsics
@@ -121,6 +124,9 @@ class MapFrame:
     contact_row: Optional[float] = None
     n_cloud: int = 0
     n_new_points: int = 0
+    # Cases de la carte d'elevation mises a jour par cette image.
+    n_dense: int = 0
+    n_cells: int = 0
     # Reconnaissance de lieu: nombre de lieux memorises, et correction
     # appliquee si une fermeture a eu lieu sur cette image.
     n_places: int = 0
@@ -250,6 +256,11 @@ class Mapper:
         self._imu: Optional[ImuSample] = None
         self._closer = LoopCloser()
         self.loop_matches = 0
+        # Carte d'elevation: la scene comme surface. Alimentee densement, elle
+        # porte le relief et la couleur du terrain la ou le nuage ne porte que
+        # des points isoles.
+        self.grid = ElevationGrid()
+        self._dense_cache: Optional[Tuple[tuple, object]] = None
 
     # -- reglages ----------------------------------------------------------
 
@@ -288,6 +299,8 @@ class Mapper:
         self._pose_kf.reset()
         self._heading_kf.reset()
         self._closer.reset()
+        self.grid.reset()
+        self._dense_cache = None
         self._rejected_motions = 0
         self.loop_matches = 0
         self._imu = None
@@ -340,6 +353,12 @@ class Mapper:
         #    affichees meme en vol stationnaire.
         self._project_ground(result, frame, bgr)
 
+        # 3bis) Le meme sol, echantillonne densement, verse dans la carte
+        #       d'elevation. La grille se recentre avant, sinon un drone qui
+        #       s'eloigne verserait hors des limites.
+        self.grid.recentre(self._pos[:2])
+        self._densify_ground(result, frame, bgr)
+
         # 4) Points hors sol: intersection des visees accumulees.
         #
         # Aucune condition de mouvement ici, contrairement a la triangulation
@@ -362,6 +381,7 @@ class Mapper:
 
         frame.nearest = self._nearest_obstacle(frame, result.timestamp)
         frame.n_cloud = len(self.cloud)
+        frame.n_cells = len(self.grid)
         frame.ok = True
         if result.state == STATE_NO_FLOW:
             frame.note = "immobile: sol mesure, relief en attente de parallaxe"
@@ -659,6 +679,100 @@ class Mapper:
                        sigma=sigma,
                        bgr=self._sample_colours(bgr, frame.ground_uv, result.scale))
         frame.n_new_points += len(world)
+
+    def _densify_ground(self, result: DetectionResult, frame: MapFrame,
+                        bgr: Optional[np.ndarray]) -> None:
+        """Verse dans la carte d'elevation tout le sol visible, pas seulement
+        les points suivis.
+
+        Le suiveur ne retient que quelques centaines de coins bien contrastes:
+        c'est ce qu'il faut pour mesurer un mouvement, pas pour decrire une
+        surface. Or un point du sol ne demande ni parallaxe, ni seconde vue,
+        ni suivi -- son rayon perce un plan connu et l'intersection est exacte.
+        Rien n'oblige donc a se limiter aux points suivis.
+
+        On echantillonne l'image sur une grille reguliere et on projette tout
+        d'un coup. Le calcul est identique a celui d'un point suivi, applique a
+        quelques milliers de pixels en une operation vectorisee: quelques
+        centaines de microsecondes pour une densite dix fois superieure.
+
+        Deux zones sont ecartees, pour des raisons opposees. Pres de
+        l'horizon, le rayon frole le plan: un degre d'erreur d'assiette y
+        deplace le point de plusieurs metres, et la surface se couvrirait d'un
+        voile faux. Autour des points signales hors sol, ce n'est justement
+        pas le sol: y appliquer l'intersection avec le plan poserait
+        l'obstacle a plat, derriere lui.
+        """
+        assert self._K is not None
+        if not config.DENSE_ENABLED:
+            return
+        w, h = result.work_size
+        step = config.DENSE_STEP_PX
+        if w <= step or h <= step:
+            return
+
+        grid = self._dense_grid(w, h, step)
+        if grid is None:
+            return
+        uv, rows, cols = grid
+
+        pts, valid = geometry.ground_points(uv, self._K, self.height_m,
+                                            tilt_deg=self._tilt, roll_deg=self._roll)
+        keep = valid & np.isfinite(pts).all(axis=1)
+        keep &= np.hypot(pts[:, 0], pts[:, 1]) < config.DENSE_MAX_RANGE_M
+        keep &= self._not_near_obstacle(result, uv, step)
+        if not keep.any():
+            return
+
+        world = self._to_world(pts[keep])
+        colours = self._sample_colours(bgr, uv[keep], result.scale)
+        frame.n_dense = self.grid.add(world, result.timestamp, colours)
+
+    def _dense_grid(self, w: int, h: int, step: int):
+        """Grille de pixels a echantillonner, sous l'horizon. Mise en cache.
+
+        La grille ne depend que de la taille d'image et du pas: la recalculer a
+        chaque image serait le poste le plus cher de la densification, pour un
+        resultat identique.
+        """
+        assert self._K is not None
+        horizon = geometry.horizon_row(self._K, self._tilt)
+        top = 0.0 if horizon is None else horizon + config.DENSE_HORIZON_MARGIN * h
+        key = (w, h, step, int(top))
+        if self._dense_cache is not None and self._dense_cache[0] == key:
+            return self._dense_cache[1]
+
+        ys = np.arange(max(0.0, top) + step * 0.5, h, step, dtype=np.float64)
+        xs = np.arange(step * 0.5, w, step, dtype=np.float64)
+        if len(ys) == 0 or len(xs) == 0:
+            self._dense_cache = (key, None)
+            return None
+        gx, gy = np.meshgrid(xs, ys)
+        uv = np.column_stack([gx.ravel(), gy.ravel()])
+        self._dense_cache = (key, (uv, len(ys), len(xs)))
+        return self._dense_cache[1]
+
+    def _not_near_obstacle(self, result: DetectionResult, uv: np.ndarray,
+                           step: int) -> np.ndarray:
+        """Ecarte les pixels proches d'un point signale hors sol."""
+        if result.off_plane is None or result.pts_cur is None:
+            return np.ones(len(uv), dtype=bool)
+        off = result.pts_cur[result.off_plane]
+        if len(off) == 0:
+            return np.ones(len(uv), dtype=bool)
+        radius = config.DENSE_OBSTACLE_MARGIN_PX
+        # Un test de distance en O(N*M) serait le seul calcul non vectorise du
+        # module. Le meme resultat s'obtient par une carte binaire dilatee,
+        # lue par indexation: cout constant par pixel echantillonne.
+        w, h = result.work_size
+        mask = np.zeros((h, w), dtype=np.uint8)
+        xi = np.clip(off[:, 0].astype(np.int32), 0, w - 1)
+        yi = np.clip(off[:, 1].astype(np.int32), 0, h - 1)
+        mask[yi, xi] = 1
+        k = 2 * radius + 1
+        mask = cv2.dilate(mask, np.ones((k, k), np.uint8))
+        return mask[np.clip(uv[:, 1].astype(np.int32), 0, h - 1),
+                    np.clip(uv[:, 0].astype(np.int32), 0, w - 1)] == 0
 
     def _to_world(self, body: np.ndarray) -> np.ndarray:
         return (body @ self._R_wb().T) + self._pos
