@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from dataclasses import dataclass
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Optional, Tuple
@@ -57,6 +58,35 @@ else:
     from .simulator import FlightSimulator, SimulatedLink, Wall
     from .updater import UpdateWatcher, install
     from .version import VERSION
+
+
+@dataclass(frozen=True)
+class ViewOptions:
+    """Etat des cases a cocher, recopie pour le fil d'analyse.
+
+    Pourquoi ne pas lire les variables Tk directement
+    -------------------------------------------------
+    L'interpreteur Tcl qui est derriere Tkinter n'est pas concu pour etre
+    appele depuis plusieurs fils. Lire une variable Tk depuis le fil d'analyse
+    ressemble a une lecture anodine, mais c'est un appel dans Tcl: selon le
+    moment, il rend la bonne valeur, ou il leve `RuntimeError: main thread is
+    not in main loop`, ou il corrompt l'etat de l'interpreteur. Cela a
+    longtemps fonctionne par chance -- l'appel tombait presque toujours pendant
+    que le fil principal attendait.
+
+    Le fil principal recopie donc ces valeurs ici, et le fil d'analyse ne lit
+    que cet objet. Il est fige (`frozen`) et remplace en bloc plutot que
+    modifie: le fil d'analyse en prend une reference au debut de chaque image
+    et travaille dessus jusqu'au bout. Une case cochee au milieu du traitement
+    ne peut donc pas produire une image a moitie redressee -- elle prendra
+    effet a l'image suivante, entierement.
+    """
+
+    flip_h: bool = config.CAMERA_FLIP_H
+    flip_v: bool = config.CAMERA_FLIP_V
+    gate: bool = True
+    flow: bool = True
+    ranges: bool = True
 
 
 class VisionApp(tk.Tk):
@@ -94,6 +124,10 @@ class VisionApp(tk.Tk):
         self._last_mapframe = None
         self._update_dismissed = False
         self._t0 = time.time()
+        # Instantane des cases a cocher, seul canal par lequel le fil
+        # d'analyse connait leur etat. Renseigne avant toute chose: le fil peut
+        # demarrer avant le premier passage de `_pump_ui`.
+        self._options = ViewOptions()
 
         self.var_host = tk.StringVar(value=host)
         self.var_source = tk.StringVar(value=source)
@@ -254,6 +288,21 @@ class VisionApp(tk.Tk):
         self.log(f"orientation: miroir H={self.var_flip_h.get()} V={self.var_flip_v.get()} "
                  f"-- reconstruction remise a zero, les distances en dependent")
 
+    def _sync_options(self) -> None:
+        """Recopie l'etat des cases pour le fil d'analyse. Fil principal seul.
+
+        Appele a chaque passage de la boucle d'affichage, soit toutes les 25
+        millisecondes: une case cochee prend effet a l'image suivante, ce qui
+        est imperceptible, et aucun widget n'a besoin de penser a prevenir.
+        """
+        self._options = ViewOptions(
+            flip_h=self.var_flip_h.get(),
+            flip_v=self.var_flip_v.get(),
+            gate=self.var_gate.get(),
+            flow=self.var_flow.get(),
+            ranges=self.var_ranges.get(),
+        )
+
     def _apply_view(self) -> None:
         self.renderer.auto_follow = self.var_follow.get()
         self.renderer.spin_dps = 12.0 if self.var_spin.get() else 0.0
@@ -343,6 +392,10 @@ class VisionApp(tk.Tk):
         self._quality_warned = 0.0
         self._apply_height()
         self._apply_view()
+        # Instantane rafraichi avant de lancer le fil: sans cela il
+        # travaillerait jusqu'a 25 ms sur des reglages perimes, et l'orientation
+        # de l'image en fait partie.
+        self._sync_options()
 
         if source == "sim":
             sim = FlightSimulator(height_m=self.mapper.height_m, speed_mps=0.8,
@@ -418,6 +471,11 @@ class VisionApp(tk.Tk):
                 time.sleep(0.004)
                 continue
 
+            # Une seule lecture de l'instantane par image, gardee jusqu'au
+            # bout: les cinq reglages restent alors coherents entre eux, meme
+            # si l'operateur coche une case en cours de traitement.
+            options = self._options
+
             bgr = cv2.imdecode(np.frombuffer(frame.jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
             if bgr is None:
                 self.log("image JPEG illisible, ignoree")
@@ -425,7 +483,7 @@ class VisionApp(tk.Tk):
 
             # Redressement avant toute analyse: la ligne d'image porte la
             # distance, et un miroir simple inverse le sens du repere.
-            bgr = geometry.orient_frame(bgr, self.var_flip_h.get(), self.var_flip_v.get())
+            bgr = geometry.orient_frame(bgr, options.flip_h, options.flip_v)
 
             # Une image ecartee ne doit pas geler l'ecran.
             #
@@ -436,7 +494,7 @@ class VisionApp(tk.Tk):
             # *rendu*: la derniere mesure valable reste affichee, signalee
             # comme telle, et l'image continue de defiler.
             quality = self.gate.check(bgr, jpeg_size=len(frame.jpeg))
-            stale = self.var_gate.get() and quality.verdict == VERDICT_REJECT
+            stale = options.gate and quality.verdict == VERDICT_REJECT
             if stale:
                 self._warn_quality(quality)
                 result, mapframe = self._last_result, self._last_mapframe
@@ -464,17 +522,18 @@ class VisionApp(tk.Tk):
                 except Exception as exc:  # noqa: BLE001
                     self.log(f"ecriture session en echec: {exc}")
 
-            composed = self._compose(bgr, result, mapframe, dt_render, stale=stale)
+            composed = self._compose(bgr, result, mapframe, dt_render, options,
+                                     stale=stale)
             ppm = overlay.to_ppm(composed)
             if ppm:
                 with self._render_lock:
                     self._render_slot = (ppm, self._status_line(result, mapframe))
 
     def _compose(self, bgr, result, mapframe, dt_render: float,
-                 stale: bool = False) -> np.ndarray:
+                 options: ViewOptions, stale: bool = False) -> np.ndarray:
         cw, ch = self._cell
-        view = overlay.draw(bgr, result, show_flow=self.var_flow.get(),
-                            mapframe=mapframe, show_ranges=self.var_ranges.get(),
+        view = overlay.draw(bgr, result, show_flow=options.flow,
+                            mapframe=mapframe, show_ranges=options.ranges,
                             stale=stale)
         link_fps = self.link.stats.fps if self.link else 0.0
         measures = panels.draw_measures((cw, ch - 16), result, mapframe,
@@ -563,6 +622,7 @@ class VisionApp(tk.Tk):
 
     def _pump_ui(self) -> None:
         self._flush_log()
+        self._sync_options()
 
         with self._render_lock:
             slot, self._render_slot = self._render_slot, None

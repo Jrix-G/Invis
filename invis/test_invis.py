@@ -743,6 +743,59 @@ def test_clusters_and_alert() -> None:
     _check(levels[0] == 0, "aucune alerte au depart, loin du mur")
 
 
+def test_ui_threading() -> None:
+    """Le fil d'analyse ne doit jamais appeler Tcl.
+
+    L'interpreteur Tcl derriere Tkinter n'est pas concu pour etre appele depuis
+    plusieurs fils. Lire une variable Tk depuis le fil d'analyse ressemble a une
+    lecture anodine mais c'est un appel dans Tcl: selon le moment il rend la
+    bonne valeur, il leve "main thread is not in main loop", ou il corrompt
+    l'etat de l'interpreteur. Cela fonctionnait par chance, l'appel tombant
+    presque toujours pendant que le fil principal attendait.
+
+    Le test rend la faute systematique: une boucle `update()` sans `mainloop()`
+    garde le fil principal hors de la boucle Tcl, et toute lecture depuis le
+    fil d'analyse echoue alors a coup sur. Avant correction, le fil mourait en
+    quelques dixiemes de seconde.
+    """
+    print("\n-- cloisonnement des fils de l'interface --------------------")
+    try:
+        import tkinter
+        tkinter.Tk().destroy()
+    except Exception as exc:  # noqa: BLE001
+        print(f"IGNORE cloisonnement des fils              (Tk indisponible: {exc})")
+        return
+
+    import threading
+    from invis.gcs_vision import VisionApp
+
+    faults = []
+    previous = threading.excepthook
+    threading.excepthook = lambda args: faults.append(args.exc_value) or previous(args)
+    try:
+        app = VisionApp(host="127.0.0.1", source="sim")
+        app.withdraw()
+        app.update()
+        app._connect()
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            app.update()
+            time.sleep(0.02)
+        alive = bool(app._worker and app._worker.is_alive())
+        mapframe = app._last_mapframe
+        app._disconnect()
+        app.destroy()
+    finally:
+        threading.excepthook = previous
+
+    _check(not faults, "aucune exception dans le fil d'analyse",
+           repr(faults[0]) if faults else "")
+    _check(alive, "le fil d'analyse survit a la boucle d'affichage")
+    _check(mapframe is not None and mapframe.n_cells > 0,
+           "la reconstruction avance malgre le cloisonnement",
+           f"{mapframe.n_cells} cases" if mapframe else "aucune image analysee")
+
+
 def test_elevation_grid() -> None:
     """La carte d'elevation doit moyenner, se recentrer et rester bornee."""
     print("\n-- carte d'elevation ----------------------------------------")
@@ -1309,6 +1362,7 @@ def main() -> int:
     test_loop_closure()
     test_elevation_grid()
     test_clusters_and_alert()
+    test_ui_threading()
     test_attitude_robustness()
     test_metric_reconstruction()
     test_scale_invariance()
